@@ -68,6 +68,14 @@ const TOOLS: &[ToolCheck] = &[
         version_args: &["--version"],
     },
     ToolCheck {
+        name: "meson",
+        version_args: &["--version"],
+    },
+    ToolCheck {
+        name: "make",
+        version_args: &["--version"],
+    },
+    ToolCheck {
         name: "bear",
         version_args: &["--version"],
     },

@@ -23,6 +23,7 @@ use crate::exec::ExecStep;
 use crate::indexers::IndexerId;
 use crate::prepare::PrepareCtx;
 
+pub mod clang;
 pub mod dotnet;
 pub mod go;
 pub mod jsts;
@@ -106,6 +107,13 @@ pub enum MarkerKind {
     BuildGradleKts,
     PomXml,
     BuildSbt,
+    // C/C++
+    CompileCommandsJson,
+    CMakeLists,
+    MesonBuild,
+    Makefile,
+    ConfigureAc,
+    Configure,
 }
 
 /// A marker filename and the kind it denotes. Families expose these as a
@@ -148,6 +156,38 @@ pub enum JvmBuildTool {
     Sbt,
 }
 
+/// Which compdb-acquisition strategy fired for a Clang root, in the brief's
+/// priority order (strongest first): an existing `compile_commands.json`
+/// beats a `CMakeLists.txt` beats a `meson.build` beats a bare `Makefile`
+/// beats `configure.ac`/`configure`. Recorded at detection time (which
+/// marker(s) a dir carries decides it); `prepare::compdb::resolve` reuses
+/// the same value to pick which build tool to drive when no compdb already
+/// exists on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClangStrategy {
+    ExistingCompdb,
+    Cmake,
+    Meson,
+    Make,
+    Autotools,
+}
+
+impl ClangStrategy {
+    /// Human label used in degrade-reason text (e.g. "cmake required for
+    /// CMake compdb generation"). Distinct from the serde repr, which stays
+    /// snake_case for the JSON contract.
+    pub fn label(self) -> &'static str {
+        match self {
+            ClangStrategy::ExistingCompdb => "ExistingCompdb",
+            ClangStrategy::Cmake => "CMake",
+            ClangStrategy::Meson => "Meson",
+            ClangStrategy::Make => "Make",
+            ClangStrategy::Autotools => "Autotools",
+        }
+    }
+}
+
 /// Family-specific metadata attached to a candidate. Serialized as an
 /// object tagged by `kind` so the JSON contract is uniform.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,6 +223,12 @@ pub enum FamilyMeta {
         /// The `.sln`/`.csproj`/`.fsproj` path (repo-relative) passed to
         /// scip-dotnet explicitly for this root.
         target: std::path::PathBuf,
+    },
+    Clang {
+        /// Which compdb strategy this root's markers resolved to. Report
+        /// evidence, and the input `prepare::compdb::resolve` reuses to
+        /// decide which build tool to drive.
+        strategy: ClangStrategy,
     },
 }
 
@@ -273,6 +319,7 @@ pub fn registry() -> Vec<Box<dyn Family>> {
         Box::new(php::Php),
         Box::new(jvm::Jvm),
         Box::new(dotnet::Dotnet),
+        Box::new(clang::Clang),
     ]
 }
 

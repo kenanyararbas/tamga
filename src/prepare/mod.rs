@@ -10,6 +10,7 @@
 //! so centralizing it keeps the trait to the three methods the pipeline
 //! actually dispatches through.
 
+pub mod compdb;
 pub mod dotnet_globaljson;
 pub mod jdk;
 
@@ -189,8 +190,15 @@ pub fn manifest_files(family: FamilyId, repo: &Path, root_dir: &Path) -> Vec<Pat
             }
             out
         }
-        // Families without a build env yet: no manifest.
-        _ => Vec::new(),
+        // C/C++: the build-system manifests present at the root (whichever
+        // of CMake/Meson/Make/Autotools exist), deterministic order. An
+        // existing `compile_commands.json` deliberately does NOT count --
+        // it's consumed directly, not a dependency-bearing manifest whose
+        // *contents* should reshape the env cache's identity.
+        FamilyId::Clang => ["CMakeLists.txt", "meson.build", "Makefile", "configure.ac"]
+            .iter()
+            .filter_map(|n| present(n))
+            .collect(),
     }
 }
 

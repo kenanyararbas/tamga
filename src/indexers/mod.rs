@@ -60,6 +60,7 @@ pub enum IndexerId {
     ScipPhp,
     ScipJava,
     ScipDotnet,
+    ScipClang,
 }
 
 impl IndexerId {
@@ -74,6 +75,7 @@ impl IndexerId {
             IndexerId::ScipPhp,
             IndexerId::ScipJava,
             IndexerId::ScipDotnet,
+            IndexerId::ScipClang,
         ]
     }
 
@@ -89,6 +91,7 @@ impl IndexerId {
             IndexerId::ScipPhp => "scip-php",
             IndexerId::ScipJava => "scip-java",
             IndexerId::ScipDotnet => "scip-dotnet",
+            IndexerId::ScipClang => "scip-clang",
         }
     }
 

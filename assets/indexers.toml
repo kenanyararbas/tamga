@@ -147,3 +147,33 @@ app = "scip-java"
 version = "0.2.14"
 dist = "dotnet-tool"
 package = "scip-dotnet"
+
+# M7 addition, verified 2026-09-09 (see task-8-report.md for the full
+# research trail):
+#
+# - scip-clang: sourcegraph/scip-clang release v0.4.0 (2026-02-23). Ships
+#   exactly 3 assets: a macOS arm64 binary, a Linux x86_64 binary, and a
+#   "-dev" (debug/symbols) Linux x86_64 build we don't use. Checksums are
+#   the sha256 GitHub itself reports for each asset (Releases API `digest`
+#   field); independently re-verified by downloading both assets used here
+#   and hashing them locally (`shasum -a 256`), and the macOS arm64 binary
+#   was additionally live-tested end to end (`--compdb-path
+#   compile_commands.json --index-output-path index.scip`) against a tiny
+#   hand-written 2-file compdb with a cross-file call. Unlike the brief's
+#   guess ("possibly no macOS arm64 binary"), a macOS arm64 binary DOES
+#   ship -- the real upstream gap is aarch64-unknown-linux-gnu (Linux
+#   arm64), which has no published asset at all and resolves to the
+#   existing "no prebuilt binary for this platform" error.
+
+[scip-clang]
+version = "0.4.0"
+dist = "github-release"
+repo = "sourcegraph/scip-clang"
+
+[scip-clang.targets.aarch64-apple-darwin]
+asset = "scip-clang-arm64-darwin"
+sha256 = "ff042fbc8a029f09f4b69fc7692e290e21c52923593207ee52d4e7439473ec64"
+
+[scip-clang.targets.x86_64-unknown-linux-gnu]
+asset = "scip-clang-x86_64-linux"
+sha256 = "06fd18c576f979a726c651594644ec4a35db4f471f2160b3f72eb89fa6001784"
