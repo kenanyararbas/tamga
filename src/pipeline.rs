@@ -22,6 +22,7 @@ use crate::exec::{
 use crate::families::{self, Family, FamilyId};
 use crate::indexers::{self, ResolvedIndexer};
 use crate::merge::{self, rebase};
+use crate::prepare::dotnet_globaljson::GlobalJsonGuard;
 use crate::prepare::{self, INDEX_STEP_ID, PrepareCtx};
 use crate::report::{IndexerInfo, RootReport, RootStats, RootStatus, RunReport, StepReport};
 use crate::workspace::{RunWorkspace, Workspace, enforce_run_retention, generate_run_id};
@@ -222,10 +223,20 @@ pub fn run_index(args: &IndexArgs) -> i32 {
         })
         .collect();
 
+    // Relax any .NET global.json SDK pins before the tasks run. The guards
+    // are held for the rest of the run; the explicit restore below covers
+    // the normal, failure, AND cancellation paths (run_tasks returns in all
+    // three), and each guard's Drop is the backstop for a panic between
+    // here and there.
+    let mut global_jsons = relax_dotnet_global_jsons(&plans, &repo_abs, &run, &config);
+
     let cancel = CancelToken::new();
     let _ = cancel.install_ctrlc_handler();
     let jobs = config.run.jobs.max(1) as usize;
     let results = run_tasks(tasks, jobs, &LocalExecutor, &cancel);
+
+    // Put every relaxed global.json back now that the pool has returned.
+    let global_json_outcomes = restore_dotnet_global_jsons(&mut global_jsons);
 
     // Collect per-root reports and the rebased indexes to merge.
     let mut root_reports = pre_reports;
@@ -237,6 +248,10 @@ pub fn run_index(args: &IndexArgs) -> i32 {
         }
         root_reports.push(report);
     }
+
+    // Fold the global.json relax/restore outcomes into the matching .NET
+    // roots' reports (repo_writes on success, a loud note if restore failed).
+    apply_global_json_outcomes(&mut root_reports, &global_json_outcomes);
 
     // Merge (unless suppressed). Per-root artifacts were already rebased and
     // rewritten in place by build_root_report.
@@ -306,6 +321,19 @@ fn build_root_report(
         report
             .repo_writes
             .push("composer install created/updated vendor/".to_string());
+    }
+
+    // .NET's `dotnet restore` writes build intermediates (obj/) directly
+    // into the repo -- an inherent, permanent build-tool write. Surface it
+    // whenever the step actually ran.
+    if result
+        .steps
+        .iter()
+        .any(|(id, _)| id == families::dotnet::DOTNET_RESTORE_STEP_ID)
+    {
+        report
+            .repo_writes
+            .push("dotnet restore wrote build intermediates (obj/) into the repo".to_string());
     }
 
     // Cancellation wins outright.
@@ -464,6 +492,147 @@ fn mark_ready_envs(plans: &[RunnablePlan], report: &RunReport, no_install: bool)
             });
         if hard_ok {
             let _ = prepare::mark_env_ready(&plan.env_dir);
+        }
+    }
+}
+
+// --- .NET global.json relax/restore ------------------------------------
+
+/// One .NET root's global.json state for the life of the run.
+struct DotnetGlobalJson {
+    root_id: String,
+    state: GuardState,
+}
+
+enum GuardState {
+    /// global.json was relaxed; the guard restores it.
+    Relaxed(GlobalJsonGuard),
+    /// global.json existed but couldn't be relaxed (best-effort: noted,
+    /// never fatal, and nothing was changed so there's nothing to restore).
+    RelaxFailed(String),
+}
+
+/// What happened to one root's global.json over the run, for reporting.
+struct GlobalJsonOutcome {
+    root_id: String,
+    kind: GlobalJsonOutcomeKind,
+}
+
+enum GlobalJsonOutcomeKind {
+    Restored,
+    RestoreFailed { backup: PathBuf },
+    RelaxFailed(String),
+}
+
+/// Whether `[families.dotnet] relax_global_json` is on (default `true`).
+fn dotnet_relax_enabled(config: &config::TamgaConfig) -> bool {
+    config
+        .families
+        .get("dotnet")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("relax_global_json"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
+/// Back up and relax the `global.json` of every runnable .NET root that has
+/// one (when `relax_global_json` is enabled). Returns the guards to hold
+/// for the run.
+fn relax_dotnet_global_jsons(
+    plans: &[RunnablePlan],
+    repo_abs: &Path,
+    run: &RunWorkspace,
+    config: &config::TamgaConfig,
+) -> Vec<DotnetGlobalJson> {
+    if !dotnet_relax_enabled(config) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for plan in plans {
+        if plan.root.candidate.family != FamilyId::Dotnet {
+            continue;
+        }
+        let global_json =
+            families::abs_root_dir(repo_abs, &plan.root.candidate.dir).join("global.json");
+        if !global_json.is_file() {
+            continue;
+        }
+        let backup = run
+            .dir
+            .join("backup")
+            .join(&plan.root.id)
+            .join("global.json");
+        let state = match GlobalJsonGuard::relax(&global_json, &backup) {
+            Ok(guard) => GuardState::Relaxed(guard),
+            Err(e) => GuardState::RelaxFailed(e.to_string()),
+        };
+        out.push(DotnetGlobalJson {
+            root_id: plan.root.id.clone(),
+            state,
+        });
+    }
+    out
+}
+
+/// Restore every relaxed global.json (idempotent with each guard's Drop),
+/// capturing per-root outcomes for the report.
+fn restore_dotnet_global_jsons(items: &mut [DotnetGlobalJson]) -> Vec<GlobalJsonOutcome> {
+    items
+        .iter_mut()
+        .map(|item| {
+            let kind = match &mut item.state {
+                GuardState::Relaxed(guard) => match guard.restore() {
+                    Ok(()) => GlobalJsonOutcomeKind::Restored,
+                    Err(e) => {
+                        eprintln!(
+                            "tamga: FAILED to restore global.json {} from backup {}: {e}",
+                            guard.original_path().display(),
+                            guard.backup_path().display()
+                        );
+                        GlobalJsonOutcomeKind::RestoreFailed {
+                            backup: guard.backup_path().to_path_buf(),
+                        }
+                    }
+                },
+                GuardState::RelaxFailed(msg) => GlobalJsonOutcomeKind::RelaxFailed(msg.clone()),
+            };
+            GlobalJsonOutcome {
+                root_id: item.root_id.clone(),
+                kind,
+            }
+        })
+        .collect()
+}
+
+/// Fold global.json outcomes into their roots' reports: a `repo_writes`
+/// entry on a clean relax+restore, a loud note (pointing at the retained
+/// backup) if the restore failed, and a best-effort note if the relax
+/// itself never happened.
+fn apply_global_json_outcomes(reports: &mut [RootReport], outcomes: &[GlobalJsonOutcome]) {
+    for outcome in outcomes {
+        let Some(report) = reports.iter_mut().find(|r| r.id == outcome.root_id) else {
+            continue;
+        };
+        match &outcome.kind {
+            GlobalJsonOutcomeKind::Restored => {
+                report
+                    .repo_writes
+                    .push("temporarily relaxed global.json (restored)".to_string());
+            }
+            GlobalJsonOutcomeKind::RestoreFailed { backup } => {
+                report
+                    .repo_writes
+                    .push("global.json relaxed but NOT restored".to_string());
+                report.notes.push(format!(
+                    "FAILED to restore global.json — original at {}",
+                    backup.display()
+                ));
+            }
+            GlobalJsonOutcomeKind::RelaxFailed(msg) => {
+                report
+                    .notes
+                    .push(format!("could not relax global.json: {msg}"));
+            }
         }
     }
 }

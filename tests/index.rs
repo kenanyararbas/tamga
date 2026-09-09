@@ -1029,6 +1029,429 @@ fn m5_case10_php_move_wrap_behavior() {
     );
 }
 
+// ---- M6: JVM + .NET pipeline integration -------------------------------
+
+/// Write a fake `dotnet` onto `dir` that answers `--version` and no-ops
+/// `restore`, so .NET `check_prereqs` passes and the restore step succeeds
+/// without a real SDK.
+fn write_fake_dotnet(dir: &Path) {
+    let script =
+        "#!/bin/sh\ncase \"$1\" in\n  --version) echo 8.0.100 ;;\n  *) : ;;\nesac\nexit 0\n";
+    let path = dir.join("dotnet");
+    fs::write(&path, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// Write a fake `java` onto `dir` whose `-version` reports `major` (to
+/// stderr, as real JDKs do), so JVM `check_prereqs` can be driven offline.
+fn write_fake_java(dir: &Path, major: u32) {
+    let script = format!("#!/bin/sh\necho 'openjdk version \"{major}.0.1\" 2026' 1>&2\nexit 0\n");
+    let path = dir.join("java");
+    fs::write(&path, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+fn scratch_path(dir: &Path) -> String {
+    format!("{}:/bin:/usr/bin", dir.display())
+}
+
+const GLOBAL_JSON: &str = "{\n  \"sdk\": {\n    \"version\": \"8.0.100\"\n  }\n}\n";
+
+/// A .NET fixture at the repo root: App.sln + global.json + a source file,
+/// with scip-dotnet config-pinned to the fake indexer.
+fn build_dotnet_fixture(repo: &Path, extra_indexer_args: &str) {
+    fs::write(
+        repo.join("App.sln"),
+        "Microsoft Visual Studio Solution File, Format Version 12.00\n",
+    )
+    .unwrap();
+    fs::write(repo.join("global.json"), GLOBAL_JSON).unwrap();
+    fs::write(
+        repo.join("Program.cs"),
+        "class P { static void Main() {} }\n",
+    )
+    .unwrap();
+    let fake = fake_indexer();
+    let fake = fake.to_str().unwrap();
+    fs::write(
+        repo.join(".tamga.toml"),
+        format!("[indexers.scip-dotnet]\npath = \"{fake}\"\nargs = [{extra_indexer_args}]\n"),
+    )
+    .unwrap();
+}
+
+// 8/10. .NET success: global.json relaxed before steps and restored after
+// (byte-identical), backup retained in the run workspace, repo_writes for
+// both the relax and the restore-writing `dotnet restore`, the restore step
+// present under auto, and the scip-dotnet argv carrying the sln target.
+#[test]
+fn m6_dotnet_success_relaxes_and_restores_global_json_with_repo_writes() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let ws = tempdir().unwrap();
+    let path_dir = tempdir().unwrap();
+    write_fake_dotnet(path_dir.path());
+    build_dotnet_fixture(repo.path(), "\"--scip-doc\", \"Program.cs\"");
+    let record_path = home.path().join("records.jsonl");
+
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .env("PATH", scratch_path(path_dir.path()))
+        .env("FAKE_RECORD_PATH", &record_path)
+        .args(["index"])
+        .arg(repo.path())
+        .arg("--workspace")
+        .arg(ws.path())
+        .assert()
+        .code(0);
+
+    let report = read_report(&ws.path().join("out"));
+    let root = root_by_dir(&report, ".");
+    assert_eq!(root["status"], "Indexed", "root: {root:#}");
+
+    // global.json is byte-identical to the original after the run.
+    assert_eq!(
+        fs::read_to_string(repo.path().join("global.json")).unwrap(),
+        GLOBAL_JSON,
+        "global.json must be restored byte-for-byte"
+    );
+
+    // The backup was retained in the run workspace.
+    let root_id = root["id"].as_str().unwrap();
+    let backup = ws.path().join("backup").join(root_id).join("global.json");
+    assert!(backup.is_file(), "backup should be retained at {backup:?}");
+    assert_eq!(fs::read_to_string(&backup).unwrap(), GLOBAL_JSON);
+
+    // repo_writes records both the temporary relax and the restore-writing
+    // dotnet restore.
+    let writes: Vec<&str> = root["repo_writes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        writes.contains(&"temporarily relaxed global.json (restored)"),
+        "repo_writes: {writes:?}"
+    );
+    assert!(
+        writes
+            .iter()
+            .any(|w| w.contains("dotnet restore") && w.contains("obj/")),
+        "repo_writes: {writes:?}"
+    );
+
+    // The restore step ran, and the scip-dotnet index argv carried the sln.
+    assert!(has_step(root, "dotnet-restore"), "root: {root:#}");
+    let records = read_records(&record_path);
+    let index_record = records
+        .iter()
+        .find(|r| {
+            r["argv"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|v| v == "index"))
+        })
+        .expect("an index-step record");
+    let argv: Vec<&str> = index_record["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(argv[1], "index");
+    assert_eq!(argv[2], "App.sln", "scip-dotnet argv must carry the target");
+}
+
+// 8. .NET induced failure: global.json is still restored when the index
+// step fails (empty index -> Degraded).
+#[test]
+fn m6_dotnet_restores_global_json_even_when_indexing_fails() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let ws = tempdir().unwrap();
+    let path_dir = tempdir().unwrap();
+    write_fake_dotnet(path_dir.path());
+    // --exit 2 with no --scip-doc -> a valid but empty index -> Degraded.
+    build_dotnet_fixture(repo.path(), "\"--exit\", \"2\"");
+
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .env("PATH", scratch_path(path_dir.path()))
+        .args(["index"])
+        .arg(repo.path())
+        .arg("--workspace")
+        .arg(ws.path())
+        .assert()
+        .code(4);
+
+    let report = read_report(&ws.path().join("out"));
+    assert_eq!(root_by_dir(&report, ".")["status"], "Degraded");
+    assert_eq!(
+        fs::read_to_string(repo.path().join("global.json")).unwrap(),
+        GLOBAL_JSON,
+        "global.json must be restored even on a failed run"
+    );
+}
+
+// 10. --no-install: no dotnet-restore step, but global.json is still
+// relaxed + restored (the SDK-pin relax is independent of dependency
+// install), and no dotnet-restore obj/ repo_writes note.
+#[test]
+fn m6_dotnet_no_install_skips_restore_but_still_relaxes_global_json() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let ws = tempdir().unwrap();
+    let path_dir = tempdir().unwrap();
+    write_fake_dotnet(path_dir.path());
+    build_dotnet_fixture(repo.path(), "\"--scip-doc\", \"Program.cs\"");
+
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .env("PATH", scratch_path(path_dir.path()))
+        .args(["index"])
+        .arg(repo.path())
+        .args(["--no-install", "--workspace"])
+        .arg(ws.path())
+        .assert()
+        .code(0);
+
+    let report = read_report(&ws.path().join("out"));
+    let root = root_by_dir(&report, ".");
+    assert!(!has_step(root, "dotnet-restore"), "root: {root:#}");
+    assert_eq!(
+        fs::read_to_string(repo.path().join("global.json")).unwrap(),
+        GLOBAL_JSON
+    );
+    let writes: Vec<&str> = root["repo_writes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        writes.contains(&"temporarily relaxed global.json (restored)"),
+        "repo_writes: {writes:?}"
+    );
+    assert!(
+        !writes.iter().any(|w| w.contains("dotnet restore")),
+        "no restore ran, so no obj/ write note: {writes:?}"
+    );
+}
+
+// global.json relax can be disabled via config; then it's never touched.
+#[test]
+fn m6_dotnet_relax_global_json_can_be_disabled() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let ws = tempdir().unwrap();
+    let path_dir = tempdir().unwrap();
+    write_fake_dotnet(path_dir.path());
+    build_dotnet_fixture(repo.path(), "\"--scip-doc\", \"Program.cs\"");
+    // Append the opt-out to the generated config.
+    let cfg = fs::read_to_string(repo.path().join(".tamga.toml")).unwrap();
+    fs::write(
+        repo.path().join(".tamga.toml"),
+        format!("{cfg}[families.dotnet]\nrelax_global_json = false\n"),
+    )
+    .unwrap();
+
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .env("PATH", scratch_path(path_dir.path()))
+        .args(["index"])
+        .arg(repo.path())
+        .arg("--workspace")
+        .arg(ws.path())
+        .assert()
+        .code(0);
+
+    let report = read_report(&ws.path().join("out"));
+    let root = root_by_dir(&report, ".");
+    assert_eq!(
+        fs::read_to_string(repo.path().join("global.json")).unwrap(),
+        GLOBAL_JSON
+    );
+    // No relax -> no backup dir, no relax repo_writes entry.
+    assert!(!ws.path().join("backup").exists());
+    let writes: Vec<&str> = root["repo_writes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        !writes.iter().any(|w| w.contains("global.json")),
+        "repo_writes: {writes:?}"
+    );
+}
+
+// 9. .NET cancellation: a slow index step is interrupted with SIGINT while
+// global.json is relaxed; the pipeline's restore path must still put it
+// back. Drives a real child process + `kill -INT`, mirroring the exec
+// tests' process-level style (self-skips on non-unix).
+#[cfg(unix)]
+#[test]
+fn m6_dotnet_cancellation_restores_global_json() {
+    use std::time::{Duration, Instant};
+
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let ws = tempdir().unwrap();
+    let path_dir = tempdir().unwrap();
+    write_fake_dotnet(path_dir.path());
+    // A slow index step (30s) gives a wide window to SIGINT mid-run.
+    build_dotnet_fixture(repo.path(), "\"--sleep\", \"30\"");
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_tamga"))
+        .env("TAMGA_HOME", home.path())
+        .env("PATH", scratch_path(path_dir.path()))
+        .args(["index"])
+        .arg(repo.path())
+        .arg("--workspace")
+        .arg(ws.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn tamga");
+
+    // Wait until global.json has actually been relaxed (rollForward
+    // appears), proving we interrupt *after* the relax, then SIGINT.
+    let gj = repo.path().join("global.json");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut relaxed = false;
+    while Instant::now() < deadline {
+        if fs::read_to_string(&gj)
+            .map(|s| s.contains("latestMajor"))
+            .unwrap_or(false)
+        {
+            relaxed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(relaxed, "global.json was never relaxed before the SIGINT");
+
+    let pid = child.id();
+    std::process::Command::new("kill")
+        .args(["-INT", &pid.to_string()])
+        .status()
+        .expect("send SIGINT");
+
+    // Bounded wait for exit (far under the 30s sleep, proving the kill took).
+    let exit_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(_status) = child.try_wait().expect("try_wait") {
+            break;
+        }
+        assert!(
+            Instant::now() < exit_deadline,
+            "tamga did not exit promptly after SIGINT"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    assert_eq!(
+        fs::read_to_string(&gj).unwrap(),
+        GLOBAL_JSON,
+        "global.json must be restored on the cancellation path"
+    );
+}
+
+// 6. JVM happy path end to end: a Gradle fixture with a fake java 17 on
+// PATH and scip-java config-pinned to the fake indexer indexes to one root.
+#[test]
+fn m6_jvm_gradle_root_indexes_with_ambient_jdk_17() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let ws = tempdir().unwrap();
+    let path_dir = tempdir().unwrap();
+    write_fake_java(path_dir.path(), 17);
+
+    fs::write(
+        repo.path().join("settings.gradle"),
+        "rootProject.name='app'\n",
+    )
+    .unwrap();
+    fs::write(repo.path().join("build.gradle"), "plugins {}\n").unwrap();
+    fs::write(repo.path().join("Main.java"), "class Main {}\n").unwrap();
+    let fake = fake_indexer();
+    let fake = fake.to_str().unwrap();
+    fs::write(
+        repo.path().join(".tamga.toml"),
+        format!(
+            "[indexers.scip-java]\npath = \"{fake}\"\nargs = [\"--scip-doc\", \"Main.java\"]\n"
+        ),
+    )
+    .unwrap();
+
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .env("PATH", scratch_path(path_dir.path()))
+        .args(["index"])
+        .arg(repo.path())
+        .args(["--no-install", "--workspace"])
+        .arg(ws.path())
+        .assert()
+        .code(0);
+
+    let report = read_report(&ws.path().join("out"));
+    let root = root_by_dir(&report, ".");
+    assert_eq!(root["status"], "Indexed", "root: {root:#}");
+    assert_eq!(root["family"], "jvm");
+    assert_eq!(root["stats"]["documents"], 1);
+}
+
+// 7. JVM with an ambient JDK below 17 degrades scip-java's own prereq with
+// the exact reason prefix.
+#[test]
+fn m6_jvm_degrades_when_ambient_jdk_below_17() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let ws = tempdir().unwrap();
+    let path_dir = tempdir().unwrap();
+    write_fake_java(path_dir.path(), 11);
+
+    fs::write(repo.path().join("build.gradle"), "plugins {}\n").unwrap();
+    fs::write(repo.path().join("Main.java"), "class Main {}\n").unwrap();
+    let fake = fake_indexer();
+    let fake = fake.to_str().unwrap();
+    fs::write(
+        repo.path().join(".tamga.toml"),
+        format!("[indexers.scip-java]\npath = \"{fake}\"\n"),
+    )
+    .unwrap();
+
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .env("PATH", scratch_path(path_dir.path()))
+        .args(["index"])
+        .arg(repo.path())
+        .args(["--no-install", "--workspace"])
+        .arg(ws.path())
+        .assert()
+        .code(4);
+
+    let report = read_report(&ws.path().join("out"));
+    let root = root_by_dir(&report, ".");
+    assert_eq!(root["status"], "Degraded");
+    assert!(
+        root["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("scip-java requires JDK 17+"),
+        "reason: {}",
+        root["reason"]
+    );
+}
+
 // 11. Standalone `merge` subcommand happy path.
 #[test]
 fn standalone_merge_combines_two_indexes() {
@@ -1180,4 +1603,188 @@ fn live_rust_analyzer_indexes_a_tiny_cargo_fixture() {
         paths.iter().any(|p| p.starts_with("src/")),
         "expected a src/ document from rust-analyzer, got: {paths:?}"
     );
+}
+
+// Live (gated): per-root JDK selection against the *real* JDKs installed on
+// this machine. Self-skips when no `java` is reachable. Verifies the
+// probe/discover/select path end to end against a real JDK (rather than the
+// fake `bin/java` scripts the offline tests use): it pins the build to the
+// ambient JDK's own major and asserts selection resolves to a real,
+// existing JDK home running that major.
+#[test]
+#[ignore = "requires a real JDK and TAMGA_LIVE=1"]
+fn live_jvm_jdk_selection_resolves_a_real_installed_jdk() {
+    use tamga::prepare::jdk::{self, RootJdk};
+
+    if std::env::var("TAMGA_LIVE").is_err() {
+        eprintln!("skipping live test: set TAMGA_LIVE=1 to enable");
+        return;
+    }
+    let Some(ambient) = jdk::probe_java_major() else {
+        eprintln!("skipping live test: no java on PATH");
+        return;
+    };
+    assert!(ambient >= 1, "probed a sane major version");
+
+    let installed = jdk::discover_jdks();
+    assert!(
+        !installed.is_empty(),
+        "expected to discover at least one installed JDK on a machine with java on PATH \
+         (set JAVA_HOME if your JDK lives outside the conventional dirs)"
+    );
+
+    // Pin a Maven root to the ambient major and confirm selection lands on
+    // a real JDK home of at least that major.
+    let repo = tempdir().unwrap();
+    fs::write(
+        repo.path().join("pom.xml"),
+        format!(
+            "<project><properties><maven.compiler.release>{ambient}</maven.compiler.release></properties></project>"
+        ),
+    )
+    .unwrap();
+    match jdk::select_for_root(repo.path(), Path::new("")) {
+        RootJdk::Use(home) => {
+            assert!(
+                home.join("bin").join("java").exists(),
+                "selected JDK home has no bin/java: {}",
+                home.display()
+            );
+            let major = jdk::probe_jdk_major(&home).expect("selected JDK probes a version");
+            assert!(
+                major >= ambient,
+                "selected {major} should satisfy pin {ambient}"
+            );
+        }
+        other => panic!("expected a JDK to be selected for pin {ambient}, got {other:?}"),
+    }
+}
+
+// Live (gated): real scip-java on a tiny build fixture. Self-skips unless
+// scip-java is on PATH and the ambient JDK is >= 17. Uses a Gradle fixture
+// when `gradle` is present, else a Maven fixture when `mvn` is present
+// (scip-java auto-detects either), since scip-java drives the real build.
+#[test]
+#[ignore = "requires real scip-java + JDK 17+ + gradle/mvn and TAMGA_LIVE=1"]
+fn live_scip_java_indexes_a_tiny_build_fixture() {
+    use tamga::prepare::jdk;
+
+    if std::env::var("TAMGA_LIVE").is_err() {
+        eprintln!("skipping live test: set TAMGA_LIVE=1 to enable");
+        return;
+    }
+    if tamga::indexers::find_on_path("scip-java").is_none() {
+        eprintln!("skipping live test: scip-java not on PATH");
+        return;
+    }
+    match jdk::probe_java_major() {
+        Some(v) if v >= 17 => {}
+        _ => {
+            eprintln!("skipping live test: scip-java needs a JDK 17+ on PATH");
+            return;
+        }
+    }
+    let has_gradle = tamga::indexers::find_on_path("gradle").is_some();
+    let has_mvn = tamga::indexers::find_on_path("mvn").is_some();
+    if !has_gradle && !has_mvn {
+        eprintln!("skipping live test: neither gradle nor mvn on PATH");
+        return;
+    }
+
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let out = tempdir().unwrap();
+    let pkg = repo.path().join("src/main/java/app");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::write(pkg.join("App.java"), "package app;\npublic class App {}\n").unwrap();
+    if has_gradle {
+        fs::write(
+            repo.path().join("settings.gradle"),
+            "rootProject.name='app'\n",
+        )
+        .unwrap();
+        fs::write(repo.path().join("build.gradle"), "plugins { id 'java' }\n").unwrap();
+    } else {
+        fs::write(
+            repo.path().join("pom.xml"),
+            "<project><modelVersion>4.0.0</modelVersion>\
+             <groupId>app</groupId><artifactId>app</artifactId><version>1.0</version>\
+             <properties><maven.compiler.release>17</maven.compiler.release></properties></project>",
+        )
+        .unwrap();
+    }
+
+    let assert = tamga()
+        .env("TAMGA_HOME", home.path())
+        .args(["index"])
+        .arg(repo.path())
+        .args(["--no-install", "--output"])
+        .arg(out.path())
+        .assert();
+    let code = assert.get_output().status.code().unwrap_or(-1);
+    assert!(code == 0 || code == 3, "unexpected exit code {code}");
+    if code == 0 {
+        let index = read_index(&out.path().join("index.scip"));
+        let paths = doc_paths(&index);
+        assert!(
+            paths.iter().any(|p| p.contains("App.java")),
+            "expected an App.java document from scip-java, got: {paths:?}"
+        );
+    }
+}
+
+// Live (gated): install scip-dotnet into a scratch TAMGA_HOME (dotnet-tool
+// dist) and index a tiny C# project. Self-skips unless `dotnet` is present.
+#[test]
+#[ignore = "requires the dotnet SDK and TAMGA_LIVE=1"]
+fn live_scip_dotnet_install_and_index_a_tiny_project() {
+    if std::env::var("TAMGA_LIVE").is_err() {
+        eprintln!("skipping live test: set TAMGA_LIVE=1 to enable");
+        return;
+    }
+    if tamga::indexers::find_on_path("dotnet").is_none() {
+        eprintln!("skipping live test: dotnet SDK not on PATH");
+        return;
+    }
+
+    let home = tempdir().unwrap();
+    // Install scip-dotnet into the scratch cache via the dotnet-tool dist.
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .args(["indexers", "install", "scip-dotnet"])
+        .assert()
+        .success();
+
+    let repo = tempdir().unwrap();
+    let out = tempdir().unwrap();
+    fs::write(
+        repo.path().join("App.csproj"),
+        "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    \
+         <OutputType>Exe</OutputType>\n    <TargetFramework>net8.0</TargetFramework>\n  \
+         </PropertyGroup>\n</Project>\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join("Program.cs"),
+        "namespace App;\npublic class Program { public static void Main() {} }\n",
+    )
+    .unwrap();
+
+    let assert = tamga()
+        .env("TAMGA_HOME", home.path())
+        .args(["index"])
+        .arg(repo.path())
+        .args(["--output"])
+        .arg(out.path())
+        .assert();
+    let code = assert.get_output().status.code().unwrap_or(-1);
+    assert!(code == 0 || code == 3, "unexpected exit code {code}");
+    if code == 0 {
+        let index = read_index(&out.path().join("index.scip"));
+        let paths = doc_paths(&index);
+        assert!(
+            paths.iter().any(|p| p.contains("Program.cs")),
+            "expected a Program.cs document from scip-dotnet, got: {paths:?}"
+        );
+    }
 }
