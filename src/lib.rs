@@ -5,4 +5,5 @@
 //! the logic in the library makes it directly testable without shelling
 //! out to the compiled binary for everything.
 
+pub mod config;
 pub mod report;
