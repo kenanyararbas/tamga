@@ -6,12 +6,22 @@
 //! `go.mod` is never subsumed — Go semantics make each module its own root.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::detect::evidence::Evidence;
 use crate::detect::walker::{MarkerHit, WalkStats};
-use crate::detect::{RootCandidate, RootStrength};
+use crate::detect::{ResolvedRoot, RootCandidate, RootStrength};
+use crate::exec::ExecStep;
 use crate::families::{self, Family, FamilyId, FamilyMeta, MarkerKind, MarkerSpec};
+use crate::indexers::IndexerId;
+use crate::prepare::{INDEX_STEP_ID, PrepareCtx};
+
+/// `go mod download` budget (before `timeout_scale`).
+const MOD_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Index-step budget (before `timeout_scale`).
+const INDEX_TIMEOUT: Duration = Duration::from_secs(120 * 60);
 
 pub struct Go;
 
@@ -95,6 +105,47 @@ impl Family for Go {
         }
         let rel = relative(&child.dir, &ancestor.dir);
         ancestor.member_patterns.iter().any(|p| Path::new(p) == rel)
+    }
+
+    fn indexer(&self) -> IndexerId {
+        IndexerId::ScipGo
+    }
+
+    fn prepare(&self, root: &ResolvedRoot, ctx: &PrepareCtx) -> Vec<ExecStep> {
+        // `go mod download` is cheap and writes only to the global module
+        // cache, so it runs unconditionally (not gated by the env cache or
+        // --no-install); its failure is a note, never fatal.
+        let root_abs = families::abs_root_dir(ctx.repo, &root.candidate.dir);
+        vec![ExecStep {
+            id: "go-mod-download".to_string(),
+            argv: vec![
+                OsString::from("go"),
+                OsString::from("mod"),
+                OsString::from("download"),
+            ],
+            cwd: root_abs,
+            env: Vec::new(),
+            timeout: ctx.timeout(MOD_DOWNLOAD_TIMEOUT),
+            log_path: ctx.log_path(&root.id, "go-mod-download"),
+            stop_on_fail: false,
+        }]
+    }
+
+    fn index_step(&self, root: &ResolvedRoot, out: &Path, ctx: &PrepareCtx) -> ExecStep {
+        let root_abs = families::abs_root_dir(ctx.repo, &root.candidate.dir);
+        ExecStep {
+            id: INDEX_STEP_ID.to_string(),
+            argv: vec![
+                ctx.indexer_argv0.clone().into(),
+                OsString::from("--output"),
+                out.into(),
+            ],
+            cwd: root_abs,
+            env: Vec::new(),
+            timeout: ctx.timeout(INDEX_TIMEOUT),
+            log_path: ctx.log_path(&root.id, INDEX_STEP_ID),
+            stop_on_fail: true,
+        }
     }
 }
 

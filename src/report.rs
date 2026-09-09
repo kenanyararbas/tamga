@@ -25,8 +25,33 @@ pub enum RootStatus {
     Cancelled,
 }
 
-/// Per-root entry in a [`RunReport`]. Kept minimal in M0; later milestones
-/// add fields such as timing and indexer identity.
+/// The indexer that produced (or would have produced) a root's index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexerInfo {
+    pub id: String,
+    pub version: Option<String>,
+    pub resolved_from: String,
+}
+
+/// One step's outcome, in execution order, as recorded for a root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepReport {
+    pub id: String,
+    /// `success` | `failed` | `timed_out` | `cancelled`.
+    pub status: String,
+    pub duration_ms: u64,
+    /// Path to this step's combined stdout/stderr log.
+    pub log: String,
+}
+
+/// Document/occurrence counts parsed from a root's produced index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootStats {
+    pub documents: u32,
+    pub occurrences: u32,
+}
+
+/// Per-root entry in a [`RunReport`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RootReport {
     pub id: String,
@@ -34,6 +59,40 @@ pub struct RootReport {
     pub dir: String,
     pub status: RootStatus,
     pub reason: Option<String>,
+    /// The resolved indexer, when one was found for this root.
+    pub indexer: Option<IndexerInfo>,
+    /// `hit` | `miss`, when an env cache applied to this root.
+    pub env_cache: Option<String>,
+    /// Steps that actually ran, in order.
+    pub steps: Vec<StepReport>,
+    /// Non-fatal observations (e.g. a best-effort install that failed, or a
+    /// salvaged index).
+    pub notes: Vec<String>,
+    /// Index statistics, when an index was produced and parsed.
+    pub stats: Option<RootStats>,
+    /// Documents whose path couldn't be mapped to the repo during rebasing
+    /// (kept anyway; see `merge::rebase`).
+    pub unmapped_documents: u32,
+}
+
+impl RootReport {
+    /// A minimal root report carrying just the identity/status fields, with
+    /// every M3 detail empty. Callers fill in what applies.
+    pub fn new(id: String, family: String, dir: String, status: RootStatus) -> Self {
+        RootReport {
+            id,
+            family,
+            dir,
+            status,
+            reason: None,
+            indexer: None,
+            env_cache: None,
+            steps: Vec::new(),
+            notes: Vec::new(),
+            stats: None,
+            unmapped_documents: 0,
+        }
+    }
 }
 
 /// Aggregate counts of root outcomes, used to derive the process exit code.
@@ -43,6 +102,9 @@ pub struct Totals {
     pub degraded: u32,
     pub skipped: u32,
     pub cancelled: u32,
+    /// Document paths that appeared in more than one root's index after
+    /// merging. Not a root-outcome count, so it never affects the exit code.
+    pub duplicate_documents: u32,
 }
 
 impl Totals {
@@ -146,6 +208,7 @@ mod tests {
             degraded,
             skipped,
             cancelled,
+            duplicate_documents: 0,
         }
     }
 
@@ -199,19 +262,21 @@ mod tests {
     #[test]
     fn run_report_exit_code_matches_its_own_roots() {
         let roots = vec![
-            RootReport {
-                id: "a".to_string(),
-                family: "python".to_string(),
-                dir: "a".to_string(),
-                status: RootStatus::Indexed,
-                reason: None,
-            },
-            RootReport {
-                id: "b".to_string(),
-                family: "go".to_string(),
-                dir: "b".to_string(),
-                status: RootStatus::Degraded,
-                reason: Some("indexer crashed".to_string()),
+            RootReport::new(
+                "a".to_string(),
+                "python".to_string(),
+                "a".to_string(),
+                RootStatus::Indexed,
+            ),
+            {
+                let mut r = RootReport::new(
+                    "b".to_string(),
+                    "go".to_string(),
+                    "b".to_string(),
+                    RootStatus::Degraded,
+                );
+                r.reason = Some("indexer crashed".to_string());
+                r
             },
         ];
         let report = RunReport::new(

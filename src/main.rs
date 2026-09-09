@@ -17,7 +17,10 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-use tamga::cli::{CleanArgs, Cli, Command, DetectArgs, DoctorArgs, IndexersAction};
+use tamga::cli::{
+    CleanArgs, Cli, Command, DetectArgs, DoctorArgs, IndexArgs, IndexersAction, IndexersListArgs,
+    MergeArgs,
+};
 use tamga::config::{CliOverrides, TamgaConfig};
 use tamga::workspace::{CleanTarget, Workspace};
 
@@ -35,15 +38,44 @@ fn main() -> anyhow::Result<ExitCode> {
 fn dispatch(cli: Cli) -> i32 {
     match cli.command {
         Command::Detect(args) => run_detect(args),
-        Command::Index(_) => stub("index"),
+        Command::Index(args) => run_index(args),
         Command::Indexers { action } => match action {
-            IndexersAction::List(_) => stub("indexers list"),
+            IndexersAction::List(args) => run_indexers_list(args),
             IndexersAction::Install(_) => stub("indexers install"),
         },
-        Command::Merge(_) => stub("merge"),
+        Command::Merge(args) => run_merge(args),
         Command::Doctor(args) => run_doctor(args),
         Command::Clean(args) => run_clean(args),
     }
+}
+
+/// `index` runs the full M3 pipeline (detect -> prepare -> index -> rebase
+/// -> merge -> report) and returns the exit code derived from the report's
+/// root outcomes (see `tamga::report::compute_exit_code`).
+fn run_index(args: IndexArgs) -> i32 {
+    tamga::pipeline::run_index(&args)
+}
+
+/// `indexers list` resolves every known indexer against the effective
+/// config (config pin -> PATH) and prints a table or JSON. Always exit 0.
+fn run_indexers_list(args: IndexersListArgs) -> i32 {
+    let config = match load_config(Some(Path::new("."))) {
+        Ok((_workspace, config)) => config,
+        Err(code) => return code,
+    };
+    let listings = tamga::indexers::list(&config);
+    if args.json {
+        println!("{}", tamga::indexers::listing_to_json(&listings));
+    } else {
+        println!("{}", tamga::indexers::format_listing(&listings));
+    }
+    0
+}
+
+/// Standalone `merge`: rebase each input onto `--repo-root` and merge into
+/// one index. Exit 0 on success, 2 on bad input / write failure.
+fn run_merge(args: MergeArgs) -> i32 {
+    tamga::merge::run_merge(&args.a, &args.b, &args.repo_root, &args.output)
 }
 
 /// M0 has no detection/exec/merge engine yet; these commands are

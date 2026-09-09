@@ -212,18 +212,20 @@ fn detect_exits_2_on_malformed_repo_config() {
 }
 
 #[test]
-fn index_is_a_stub_that_exits_1() {
+fn index_on_an_empty_dir_exits_5() {
     let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
     tamga()
         .env("TAMGA_HOME", home.path())
         .arg("index")
+        .arg(repo.path())
         .assert()
-        .code(1)
-        .stderr(predicate::str::contains("not yet implemented"));
+        .code(5)
+        .stdout(predicate::str::contains("No roots"));
 }
 
 #[test]
-fn merge_is_a_stub_that_exits_1() {
+fn merge_with_missing_inputs_exits_2() {
     let home = tempdir().unwrap();
     tamga()
         .env("TAMGA_HOME", home.path())
@@ -237,23 +239,24 @@ fn merge_is_a_stub_that_exits_1() {
             "out.scip",
         ])
         .assert()
-        .code(1)
-        .stderr(predicate::str::contains("not yet implemented"));
+        .code(2)
+        .stderr(predicate::str::contains("tamga merge:"));
 }
 
 #[test]
-fn indexers_list_is_a_stub_that_exits_1() {
+fn indexers_list_runs_and_names_known_indexers() {
     let home = tempdir().unwrap();
     tamga()
         .env("TAMGA_HOME", home.path())
         .args(["indexers", "list"])
         .assert()
-        .code(1)
-        .stderr(predicate::str::contains("not yet implemented"));
+        .success()
+        .stdout(predicate::str::contains("scip-python"))
+        .stdout(predicate::str::contains("scip-go"));
 }
 
 #[test]
-fn indexers_install_is_a_stub_that_exits_1() {
+fn indexers_install_is_still_a_stub() {
     let home = tempdir().unwrap();
     tamga()
         .env("TAMGA_HOME", home.path())

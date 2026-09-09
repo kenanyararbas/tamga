@@ -18,7 +18,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::detect::evidence::Evidence;
 use crate::detect::walker::{MarkerHit, WalkStats};
-use crate::detect::{RootCandidate, RootStrength};
+use crate::detect::{ResolvedRoot, RootCandidate, RootStrength};
+use crate::exec::ExecStep;
+use crate::indexers::IndexerId;
+use crate::prepare::PrepareCtx;
 
 pub mod go;
 pub mod jsts;
@@ -148,6 +151,20 @@ pub trait Family: Sync + Send {
         let _ = (ancestor, child, repo);
         true
     }
+
+    /// The SCIP indexer that produces this family's indexes (ruling R1:
+    /// the trait grows an indexing surface now that M3 has landed).
+    fn indexer(&self) -> IndexerId;
+
+    /// Dependency/environment prep steps to run before indexing `root`.
+    /// Returns an empty vec when nothing needs doing (e.g. a warm env
+    /// cache). Steps that are merely best-effort set `stop_on_fail=false`
+    /// so their failure is noted, not fatal.
+    fn prepare(&self, root: &ResolvedRoot, ctx: &PrepareCtx) -> Vec<ExecStep>;
+
+    /// The step that runs the indexer and writes the root's `.scip` to
+    /// `out`.
+    fn index_step(&self, root: &ResolvedRoot, out: &Path, ctx: &PrepareCtx) -> ExecStep;
 }
 
 /// The families wired into the engine for this milestone.
@@ -197,6 +214,24 @@ fn build_globset(patterns: &[String]) -> Option<GlobSet> {
         return None;
     }
     builder.build().ok()
+}
+
+/// Absolute path of a root's dir: `repo` itself for the repo root (`""`),
+/// else `repo/dir`.
+pub(crate) fn abs_root_dir(repo: &Path, dir: &Path) -> std::path::PathBuf {
+    if dir.as_os_str().is_empty() {
+        repo.to_path_buf()
+    } else {
+        repo.join(dir)
+    }
+}
+
+/// Human-ish name for a root dir, used as e.g. `--project-name`. The repo
+/// root (`""`) is named `"root"`.
+pub(crate) fn root_dir_name(dir: &Path) -> String {
+    dir.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "root".to_string())
 }
 
 /// Join `repo / dir / name`, treating an empty `dir` as the repo root

@@ -10,12 +10,22 @@
 //! subtree has no `.py` files is dropped.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::detect::evidence::Evidence;
 use crate::detect::walker::{MarkerHit, WalkStats};
-use crate::detect::{RootCandidate, RootStrength};
+use crate::detect::{ResolvedRoot, RootCandidate, RootStrength};
+use crate::exec::ExecStep;
 use crate::families::{self, Family, FamilyId, FamilyMeta, MarkerKind, MarkerSpec};
+use crate::indexers::{self, IndexerId};
+use crate::prepare::{self, INDEX_STEP_ID, PrepareCtx};
+
+/// Best-effort dependency install budget (before `timeout_scale`).
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Index-step budget (before `timeout_scale`).
+const INDEX_TIMEOUT: Duration = Duration::from_secs(120 * 60);
 
 pub struct Python;
 
@@ -126,6 +136,123 @@ impl Family for Python {
         } else {
             // Plain project: swallow only stray Weak children.
             families::is_weak(child)
+        }
+    }
+
+    fn indexer(&self) -> IndexerId {
+        IndexerId::ScipPython
+    }
+
+    fn prepare(&self, root: &ResolvedRoot, ctx: &PrepareCtx) -> Vec<ExecStep> {
+        // Warm cache or an explicit --no-install means no env work: the
+        // index step just runs against whatever interpreter is available.
+        if ctx.env_cache_hit || ctx.no_install {
+            return Vec::new();
+        }
+
+        let root_abs = families::abs_root_dir(ctx.repo, &root.candidate.dir);
+        let venv = ctx.env_dir.join("venv");
+        let uv = indexers::find_on_path("uv");
+
+        let mut steps = Vec::new();
+
+        // 1. Create the venv (hard prerequisite).
+        let venv_argv: Vec<OsString> = match &uv {
+            Some(uv_bin) => vec![uv_bin.into(), "venv".into(), venv.clone().into()],
+            None => vec![
+                "python3".into(),
+                "-m".into(),
+                "venv".into(),
+                venv.clone().into(),
+            ],
+        };
+        steps.push(ExecStep {
+            id: "venv".to_string(),
+            argv: venv_argv,
+            cwd: root_abs.clone(),
+            env: Vec::new(),
+            timeout: ctx.timeout(INSTALL_TIMEOUT),
+            log_path: ctx.log_path(&root.id, "venv"),
+            stop_on_fail: true,
+        });
+
+        // 2. Install dependencies (best-effort). Prefer an editable install
+        // when there's a project manifest, else requirements.txt.
+        let has_project =
+            root_abs.join("pyproject.toml").is_file() || root_abs.join("setup.py").is_file();
+        let has_requirements = root_abs.join("requirements.txt").is_file();
+        let target: Option<Vec<OsString>> = if has_project {
+            Some(vec!["-e".into(), ".".into()])
+        } else if has_requirements {
+            Some(vec!["-r".into(), "requirements.txt".into()])
+        } else {
+            None
+        };
+
+        if let Some(target) = target {
+            let venv_python = venv.join("bin").join("python");
+            let install_argv: Vec<OsString> = match &uv {
+                Some(uv_bin) => {
+                    let mut a: Vec<OsString> = vec![
+                        uv_bin.into(),
+                        "pip".into(),
+                        "install".into(),
+                        "--python".into(),
+                        venv_python.into(),
+                    ];
+                    a.extend(target);
+                    a
+                }
+                None => {
+                    let pip = venv.join("bin").join("pip");
+                    let mut a: Vec<OsString> = vec![pip.into(), "install".into()];
+                    a.extend(target);
+                    a
+                }
+            };
+            steps.push(ExecStep {
+                id: "deps-install".to_string(),
+                argv: install_argv,
+                cwd: root_abs,
+                env: Vec::new(),
+                timeout: ctx.timeout(INSTALL_TIMEOUT),
+                log_path: ctx.log_path(&root.id, "deps-install"),
+                stop_on_fail: false,
+            });
+        }
+
+        steps
+    }
+
+    fn index_step(&self, root: &ResolvedRoot, out: &Path, ctx: &PrepareCtx) -> ExecStep {
+        let root_abs = families::abs_root_dir(ctx.repo, &root.candidate.dir);
+        let venv = ctx.env_dir.join("venv");
+        let project_name = families::root_dir_name(&root.candidate.dir);
+
+        let argv: Vec<OsString> = vec![
+            ctx.indexer_argv0.clone().into(),
+            "index".into(),
+            ".".into(),
+            "--output".into(),
+            out.into(),
+            "--project-name".into(),
+            project_name.into(),
+        ];
+
+        ExecStep {
+            id: INDEX_STEP_ID.to_string(),
+            argv,
+            cwd: root_abs,
+            env: vec![
+                (
+                    OsString::from("PATH"),
+                    prepare::prepend_path(&venv.join("bin")),
+                ),
+                (OsString::from("VIRTUAL_ENV"), venv.into()),
+            ],
+            timeout: ctx.timeout(INDEX_TIMEOUT),
+            log_path: ctx.log_path(&root.id, INDEX_STEP_ID),
+            stop_on_fail: true,
         }
     }
 }

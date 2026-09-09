@@ -11,14 +11,24 @@
 //! there is none. `meta` records `ts_mode` and the package manager.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::detect::evidence::Evidence;
 use crate::detect::walker::{MarkerHit, WalkStats};
-use crate::detect::{RootCandidate, RootStrength};
+use crate::detect::{ResolvedRoot, RootCandidate, RootStrength};
+use crate::exec::ExecStep;
 use crate::families::{
     self, Family, FamilyId, FamilyMeta, MarkerKind, MarkerSpec, PackageManager, TsMode,
 };
+use crate::indexers::IndexerId;
+use crate::prepare::{INDEX_STEP_ID, PrepareCtx};
+
+/// Dependency-install budget (before `timeout_scale`).
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Index-step budget (before `timeout_scale`).
+const INDEX_TIMEOUT: Duration = Duration::from_secs(120 * 60);
 
 pub struct JsTs;
 
@@ -149,6 +159,105 @@ impl Family for JsTs {
             false
         }
     }
+
+    fn indexer(&self) -> IndexerId {
+        IndexerId::ScipTypescript
+    }
+
+    fn prepare(&self, root: &ResolvedRoot, ctx: &PrepareCtx) -> Vec<ExecStep> {
+        let root_abs = families::abs_root_dir(ctx.repo, &root.candidate.dir);
+        let node_modules_present = root_abs.join("node_modules").is_dir();
+
+        // Install only when the cache is cold, deps aren't already present,
+        // and installing is allowed.
+        if ctx.env_cache_hit || node_modules_present || !install_allowed(ctx) {
+            return Vec::new();
+        }
+
+        let pm = package_manager(&root.candidate.meta);
+        let lockfile_present = root_abs.join("package-lock.json").is_file();
+        let argv: Vec<OsString> = match pm {
+            PackageManager::Pnpm => str_argv(&["pnpm", "install", "--frozen-lockfile"]),
+            PackageManager::Yarn => str_argv(&["yarn", "install", "--frozen-lockfile"]),
+            PackageManager::Bun => str_argv(&["bun", "install"]),
+            PackageManager::Npm if lockfile_present => str_argv(&["npm", "ci"]),
+            PackageManager::Npm => str_argv(&["npm", "install"]),
+        };
+
+        vec![ExecStep {
+            id: "deps-install".to_string(),
+            argv,
+            cwd: root_abs,
+            env: Vec::new(),
+            timeout: ctx.timeout(INSTALL_TIMEOUT),
+            log_path: ctx.log_path(&root.id, "deps-install"),
+            stop_on_fail: false,
+        }]
+    }
+
+    fn index_step(&self, root: &ResolvedRoot, out: &Path, ctx: &PrepareCtx) -> ExecStep {
+        let root_abs = families::abs_root_dir(ctx.repo, &root.candidate.dir);
+
+        let mut argv: Vec<OsString> = vec![
+            ctx.indexer_argv0.clone().into(),
+            "index".into(),
+            "--cwd".into(),
+            root_abs.clone().into(),
+            "--output".into(),
+            out.into(),
+        ];
+        // A JS-only root has no tsconfig.json; let scip-typescript infer one.
+        if matches!(
+            root.candidate.meta,
+            FamilyMeta::JsTs {
+                ts_mode: TsMode::JsOnly,
+                ..
+            }
+        ) {
+            argv.push("--infer-tsconfig".into());
+        }
+
+        ExecStep {
+            id: INDEX_STEP_ID.to_string(),
+            argv,
+            cwd: root_abs,
+            env: Vec::new(),
+            timeout: ctx.timeout(INDEX_TIMEOUT),
+            log_path: ctx.log_path(&root.id, INDEX_STEP_ID),
+            stop_on_fail: true,
+        }
+    }
+}
+
+/// Whether dependency installs are permitted this run: never under
+/// `--no-install`, otherwise governed by `[families.jsts] install`
+/// (`"auto"` default, `"never"` to opt out).
+fn install_allowed(ctx: &PrepareCtx) -> bool {
+    if ctx.no_install {
+        return false;
+    }
+    let mode = ctx
+        .config
+        .families
+        .get("jsts")
+        .and_then(|v| v.as_table())
+        .and_then(|t| t.get("install"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("auto");
+    mode != "never"
+}
+
+fn package_manager(meta: &FamilyMeta) -> PackageManager {
+    match meta {
+        FamilyMeta::JsTs {
+            package_manager, ..
+        } => *package_manager,
+        _ => PackageManager::Npm,
+    }
+}
+
+fn str_argv(parts: &[&str]) -> Vec<OsString> {
+    parts.iter().map(OsString::from).collect()
 }
 
 /// Build the candidate for a dir that has a `package.json`.
