@@ -9,9 +9,14 @@ then run its indexer), and `check_prereqs()` (an upfront hard-requirement
 check that degrades the root with an exact reason before any step runs, if
 overridden).
 
-Every family accepts `[families.<slug>]` config; unless noted, unknown
-sub-keys are simply ignored (the table is opaque to `config.rs` --
-individual families interpret their own keys).
+`[families.<slug>]` tables are opaque as far as `config.rs` is concerned --
+unknown sub-keys never fail to parse. Only some families actually read any:
+`dotnet`/`jsts`/`php`/`ruby` each read their own `install` key (`"auto"`
+default, `"never"` to skip that family's dependency-install step); `dotnet`
+additionally reads `relax_global_json`; `clang` reads `allow_make`/`build`.
+**Python, Go, Rust, and JVM read no `[families.<slug>]` keys at all** in
+v1 -- see each section below for exactly what (if anything) gates their
+prepare steps instead.
 
 ## Python (`python`)
 
@@ -29,7 +34,9 @@ Otherwise: (1) `uv venv <env>/venv` (or `python3 -m venv` if `uv` isn't on
 PATH) -- **hard**, a failure here degrades the root; (2) an editable
 install (`uv pip install --python <venv>/bin/python -e .`, or
 `-r requirements.txt` for a Weak root) -- **best-effort**, its failure is
-only a note.
+only a note. Unlike dotnet/jsts/php/ruby, Python reads **no**
+`[families.python]` config key at all -- there is no per-family way to opt
+out of the install step short of the global `--no-install` flag.
 
 **Indexer.** `scip-python` (npm dist). Index step: `scip-python index . --output <out> --project-name <dir-name>`, cwd = the root.
 

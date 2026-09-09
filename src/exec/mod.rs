@@ -460,9 +460,15 @@ mod tests {
     #[test]
     fn install_ctrlc_handler_compiles_and_returns_ok() {
         let token = CancelToken::new();
-        // ctrlc::set_handler overwrites any previous handler, so this is
-        // safe to call even if other tests in this binary also install
-        // one.
+        // `ctrlc::set_handler` does NOT overwrite silently on a second
+        // call within the same process -- it errors `MultipleHandlers`
+        // (its `overwrite: true` only governs whether it's an error that
+        // some other, non-ctrlc handler already claimed the signal before
+        // this first call). This test is the only caller of
+        // `install_ctrlc_handler` in the `--lib` binary: `pipeline.rs`'s
+        // own call only ever runs inside a freshly-spawned `tamga`
+        // subprocess (via the `assert_cmd`-based integration tests), never
+        // in-process here, so there is no second call to race against.
         assert!(token.install_ctrlc_handler().is_ok());
     }
 }

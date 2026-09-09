@@ -78,8 +78,15 @@ built-in defaults  <  <TAMGA_HOME>/config.toml  <  <repo>/.tamga.toml  <  CLI fl
 ```toml
 [scan]
 extra_ignore = ["fixtures/", "*.generated.*"]  # extra gitignore-style globs
-unignore = ["!vendor/one-real-package/"]        # re-include something the
-                                                  # built-in overlay excludes
+unignore = ["vendor"]  # re-include a name from the built-in ignore overlay
+                        # (BUILTIN_IGNORE_DIRS/_GLOBS) -- exact-string match
+                        # against overlay entries only, no `!`-negation, no
+                        # path scoping. This re-includes *every* directory
+                        # literally named "vendor" anywhere in the repo, not
+                        # one specific path; only the overlay's own names
+                        # ("vendor", "node_modules", "target", ... -- see
+                        # `BUILTIN_IGNORE_DIRS` in src/detect/walker.rs) are
+                        # valid values here.
 max_depth = 16                                   # walk depth cap (default 16)
 
 [run]
@@ -87,9 +94,13 @@ jobs = 2            # concurrent root budget (a JVM/.NET/C++ root costs 2)
 keep = 5             # how many run workspaces to retain under runs/
 timeout_scale = 1.0  # multiply every step's timeout by this factor
 
-[families.python]    # per-family knobs; each family interprets its own
-install = "auto"      # "auto" (default) or "never" -- most families support
-                       # this; see docs/families.md for exact keys per family
+[families.jsts]       # per-family knobs; not every family reads any -- see
+install = "never"      # docs/families.md for exact keys per family. "auto"
+                        # (default) or "never" here, supported by
+                        # dotnet/jsts/php/ruby's own dependency-install
+                        # step. Python has no [families.python] keys at all
+                        # in v1 -- its venv/install steps are only gated by
+                        # the env cache and the global --no-install flag.
 
 [indexers.scip-python] # per-indexer overrides
 path = "/opt/scip-python"  # pin to an exact binary, bypassing PATH/cache
