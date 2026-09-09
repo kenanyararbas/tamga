@@ -5,10 +5,22 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
-chrono = "0.4.45"
+# Only `Utc::now()` + `.format()`/`.to_rfc3339()` are used (workspace.rs,
+# pipeline.rs) -- no chrono types are ever serialized, so `serde` isn't
+# needed. `clock` pulls in `now` -> `std` -> `alloc` transitively, which is
+# everything the above actually requires; `default-features = false` drops
+# `oldtime` (unused legacy Duration compat) and `wasmbind` (this is a
+# native CLI, never WASM).
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6.6", features = ["derive"] }
 command-group = "5.0.1"
-ctrlc = "3.5.2"
+# `termination`: without it, `ctrlc::set_handler` only installs a SIGINT
+# handler; with it, the same handler is also installed for SIGTERM (and
+# SIGHUP) on unix, so `CancelToken::install_ctrlc_handler`'s one call
+# covers a `kill`/systemd-style SIGTERM the same way it already covers
+# Ctrl-C, closing the gap M6's review noted (SIGTERM left global.json
+# relaxed with no restore hook).
+ctrlc = { version = "3.5.2", features = ["termination"] }
 flate2 = "1.1.10"
 globset = "0.4.16"
 hex = "0.4.3"

@@ -144,6 +144,11 @@ pub struct ResolvedIndexer {
     /// `[indexers.<id>] args = [...]`. Empty for most real runs; tests use
     /// it to inject fake-indexer flags (`--scip-doc ...`).
     pub extra_args: Vec<String>,
+    /// A non-fatal, honest observation about this resolution worth
+    /// surfacing on the root's report (e.g. a `[indexers.<id>] path`
+    /// config pin that exists but isn't executable) -- `None` for the
+    /// overwhelming common case where resolution has nothing to flag.
+    pub warning: Option<String>,
 }
 
 /// Look a binary up on `$PATH`, returning the first match. `which`
@@ -271,6 +276,19 @@ fn resolve_pre_download(
         if !path.is_file() {
             return PreDownload::PinMissing;
         }
+        // The file exists but may not actually be runnable (wrong
+        // permissions, a non-executable file mistakenly pinned, etc.) --
+        // that's not "missing" (a hard error), but it's worth an honest
+        // warning on the report rather than only surfacing as an opaque
+        // spawn failure once the index step actually tries to run it.
+        let warning = if is_executable_file(&path) {
+            None
+        } else {
+            Some(format!(
+                "pinned indexer path {} is not executable",
+                path.display()
+            ))
+        };
         let version = probe_version(&path);
         return PreDownload::Resolved(ResolvedIndexer {
             id,
@@ -278,6 +296,7 @@ fn resolve_pre_download(
             version,
             resolved_from: ResolvedFrom::ConfigPin,
             extra_args,
+            warning,
         });
     }
 
@@ -289,6 +308,7 @@ fn resolve_pre_download(
             version,
             resolved_from: ResolvedFrom::Path,
             extra_args,
+            warning: None,
         });
     }
 
@@ -307,6 +327,7 @@ fn resolve_pre_download(
             version,
             resolved_from: ResolvedFrom::Path,
             extra_args,
+            warning: None,
         });
     }
 
@@ -324,6 +345,7 @@ fn resolve_pre_download(
             version: probed.or(Some(version)),
             resolved_from: ResolvedFrom::Cache,
             extra_args,
+            warning: None,
         });
     }
 
@@ -414,6 +436,7 @@ pub fn resolve(
                         version: probed.or(Some(version)),
                         resolved_from: ResolvedFrom::Downloaded,
                         extra_args,
+                        warning: None,
                     })
                 }
                 Err(e) => Err(acquire_error_reason(id, &e)),
@@ -427,7 +450,11 @@ pub fn resolve(
 /// anything else.
 fn acquire_error_reason(id: IndexerId, e: &AcquireError) -> String {
     match e {
-        AcquireError::ChecksumMismatch { asset } => format!("checksum mismatch for {asset}"),
+        // `AcquireError`'s own `Display` (via thiserror's `#[error(...)]`)
+        // already renders this exactly as "checksum mismatch for
+        // <asset>" -- delegate instead of re-typing the literal a second
+        // time, so the two can never drift apart.
+        AcquireError::ChecksumMismatch { .. } => e.to_string(),
         AcquireError::NpmMissing => format!("npm required to install {}", id.id_str()),
         AcquireError::ComposerMissing => format!("composer required to install {}", id.id_str()),
         AcquireError::CoursierMissing => {
@@ -711,6 +738,48 @@ mod tests {
     }
 
     #[test]
+    fn config_pin_to_a_non_executable_file_resolves_with_a_warning() {
+        let dir = tempdir().unwrap();
+        let pinned = dir.path().join("my-indexer");
+        // A real, existing file -- but never made executable.
+        fs::write(&pinned, b"not a real binary\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&pinned, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let cfg = config_with_indexer("scip-python", &format!("path = \"{}\"\n", pinned.display()));
+        let workspace = Workspace::at(tempdir().unwrap().path());
+        let manifest = Manifest::default();
+
+        let resolved = resolve_cached(IndexerId::ScipPython, &cfg, &workspace, &manifest).unwrap();
+
+        assert_eq!(resolved.resolved_from, ResolvedFrom::ConfigPin);
+        assert_eq!(resolved.path, pinned);
+        assert_eq!(
+            resolved.warning,
+            Some(format!(
+                "pinned indexer path {} is not executable",
+                pinned.display()
+            ))
+        );
+    }
+
+    #[test]
+    fn config_pin_to_an_executable_file_resolves_with_no_warning() {
+        let dir = tempdir().unwrap();
+        let fake = dir.path().join("my-indexer");
+        write_executable(&fake, b"#!/bin/sh\necho x\n");
+        let cfg = config_with_indexer("scip-python", &format!("path = \"{}\"\n", fake.display()));
+        let workspace = Workspace::at(tempdir().unwrap().path());
+        let manifest = Manifest::default();
+
+        let resolved = resolve_cached(IndexerId::ScipPython, &cfg, &workspace, &manifest).unwrap();
+
+        assert_eq!(resolved.warning, None);
+    }
+
+    #[test]
     fn config_pin_wins_over_path() {
         let dir = tempdir().unwrap();
         let fake = dir.path().join("my-indexer");
@@ -739,6 +808,44 @@ mod tests {
         let err = resolve(IndexerId::ScipGo, &cfg, &opts).unwrap_err();
         assert_eq!(err, "pinned indexer path missing");
         assert_eq!(fetcher.calls(), 0);
+    }
+
+    /// `acquire_error_reason`'s `ChecksumMismatch` arm delegates to
+    /// `AcquireError`'s own `Display` rather than re-typing the message, so
+    /// this locks the two together: whatever `resolve()` surfaces as the
+    /// degrade reason must be byte-identical to `AcquireError::
+    /// ChecksumMismatch { .. }.to_string()`, not a hand-maintained copy
+    /// that could silently drift if the `Display` wording ever changes.
+    #[test]
+    fn checksum_mismatch_reason_matches_acquire_errors_own_display() {
+        let ws_dir = tempdir().unwrap();
+        let workspace = Workspace::at(ws_dir.path());
+        // The manifest's sha256 ("irrelevant-for-cache-hit-tests") can
+        // never match a real digest, so any bytes the fetcher serves
+        // trigger a checksum mismatch on the asset name below.
+        let manifest = test_manifest("1.0.0", &acquire::host_target_triple().unwrap());
+        struct BytesFetcher;
+        impl Fetcher for BytesFetcher {
+            fn fetch(&self, _url: &str) -> Result<Vec<u8>, AcquireError> {
+                Ok(b"whatever bytes".to_vec())
+            }
+        }
+        let cfg = TamgaConfig::default();
+        let opts = ResolveOptions {
+            workspace: &workspace,
+            manifest: &manifest,
+            offline: false,
+            fetcher: &BytesFetcher,
+        };
+
+        let err = resolve(IndexerId::ScipGo, &cfg, &opts).unwrap_err();
+
+        let expected = AcquireError::ChecksumMismatch {
+            asset: "scip-go.tar.gz".to_string(),
+        }
+        .to_string();
+        assert_eq!(err, expected);
+        assert_eq!(err, "checksum mismatch for scip-go.tar.gz");
     }
 
     #[test]

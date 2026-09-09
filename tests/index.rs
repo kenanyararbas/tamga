@@ -200,6 +200,64 @@ fn one_missing_indexer_degrades_only_its_root() {
     );
 }
 
+// A `[indexers.<id>] path` config pin that exists but isn't executable
+// resolves (it's not "missing") and carries a warning note on the root's
+// report, surfaced up front rather than only showing up as an opaque spawn
+// failure once the index step actually tries to run it.
+#[test]
+fn non_executable_config_pin_resolves_with_a_warning_note() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let out = tempdir().unwrap();
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    fs::write(
+        repo.path().join("pyproject.toml"),
+        "[project]\nname = \"x\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(repo.path().join("src/app.py"), "x = 1\n").unwrap();
+
+    // A real file that exists but was never made executable.
+    let pinned = repo.path().join("not-executable-scip-python");
+    fs::write(&pinned, b"not a real binary\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&pinned, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    fs::write(
+        repo.path().join(".tamga.toml"),
+        format!(
+            "[indexers.scip-python]\npath = \"{}\"\n",
+            pinned.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    let _ = tamga()
+        .env("TAMGA_HOME", home.path())
+        .args(["index"])
+        .arg(repo.path())
+        .args(["--no-install", "--offline", "--output"])
+        .arg(out.path())
+        .assert();
+
+    let report = read_report(out.path());
+    let root = root_by_dir(&report, ".");
+    let notes: Vec<&str> = root["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains("is not executable") && n.contains("not-executable-scip-python")),
+        "notes: {notes:?}"
+    );
+}
+
 // 3. All indexers missing -> all Degraded, exit 4.
 #[test]
 fn all_missing_indexers_degrade_everything() {
@@ -1381,6 +1439,95 @@ fn walkdir_count_global_json(dir: &Path) -> usize {
     count
 }
 
+// M8: SIGTERM must cancel a running task exactly the way SIGINT already
+// does -- the gap the M6 review noted (only SIGINT was handled; a
+// `kill`/systemd-style SIGTERM left a run to die uncleanly, e.g. with
+// global.json still relaxed and no restore). Closed by enabling ctrlc's
+// `termination` Cargo feature (Cargo.toml), which makes the *same*
+// `set_handler` call `CancelToken::install_ctrlc_handler` already made
+// also install for SIGTERM (and SIGHUP) on unix -- no new call site, no new
+// signal-handling code, just the existing hook covering more signals.
+// Drives a real child process + `kill -TERM`, mirroring the SIGINT test
+// below at the process level (self-skips on non-unix).
+#[cfg(unix)]
+#[test]
+fn sigterm_cancels_a_running_task_the_same_way_sigint_does() {
+    use std::time::{Duration, Instant};
+
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let ws = tempdir().unwrap();
+    let out = tempdir().unwrap();
+    fs::write(
+        repo.path().join("pyproject.toml"),
+        "[project]\nname = \"x\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::write(repo.path().join("app.py"), "x = 1\n").unwrap();
+    let fake = fake_indexer();
+    let fake = fake.to_str().unwrap();
+    fs::write(
+        repo.path().join(".tamga.toml"),
+        format!("[indexers.scip-python]\npath = \"{fake}\"\nargs = [\"--sleep\", \"30\"]\n"),
+    )
+    .unwrap();
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_tamga"))
+        .env("TAMGA_HOME", home.path())
+        .args(["index"])
+        .arg(repo.path())
+        .arg("--workspace")
+        .arg(ws.path())
+        .args(["--no-install", "--output"])
+        .arg(out.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn tamga");
+
+    // Wait until the index step's log file actually exists -- proof the
+    // pool has started running it, which (in the pipeline's own program
+    // order) can only happen *after* `install_ctrlc_handler` was already
+    // called. A fixed sleep raced this in practice (observed a flake where
+    // 500ms wasn't enough on a loaded machine and the bare SIGTERM default
+    // action killed the process before the handler was installed).
+    let index_log = ws.path().join("logs").join("root+python").join("index.log");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !index_log.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "index step never started (no log file at {})",
+            index_log.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let pid = child.id();
+    std::process::Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .expect("send SIGTERM");
+
+    // Bounded wait for exit (far under the 30s sleep, proving the signal
+    // actually cancelled the run rather than being ignored).
+    let exit_deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        assert!(
+            Instant::now() < exit_deadline,
+            "tamga did not exit promptly after SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    assert_eq!(status.code(), Some(130), "cancellation exit code");
+    let report = read_report(out.path());
+    let root = root_by_dir(&report, ".");
+    assert_eq!(root["status"], "Cancelled", "root: {root:#}");
+}
+
 // 9. .NET cancellation: a slow index step is interrupted with SIGINT while
 // global.json is relaxed; the pipeline's restore path must still put it
 // back. Drives a real child process + `kill -INT`, mirroring the exec
@@ -1604,7 +1751,14 @@ fn live_scip_python_produces_backend_docs() {
     build_polyglot(repo.path());
     // No pins: use the real indexers from PATH.
 
-    // scip-go is typically absent, so gosvc degrades; exit is 0 or 3.
+    // gosvc's outcome is genuinely unpredictable here, not just "typically
+    // absent": scip-go has a real github-release acquisition manifest
+    // (since M4), and this scratch TAMGA_HOME plus no `--offline`/
+    // `--no-install`-for-indexers means tamga will actually attempt a live
+    // network download+install of scip-go if it isn't already on PATH or
+    // cached -- which succeeds outright on a machine with network access.
+    // Either way (indexed via a fresh download, or degraded because the
+    // download failed/was unavailable) is a valid outcome; exit is 0 or 3.
     let assert = tamga()
         .env("TAMGA_HOME", home.path())
         .args(["index"])
@@ -2608,5 +2762,128 @@ fn live_scip_clang_indexes_a_tiny_cmake_fixture_incrementally() {
             paths.iter().any(|p| p.contains("main.c")),
             "run {run}: expected a main.c document, got: {paths:?}"
         );
+    }
+}
+
+// ---- M8: full polyglot live suite --------------------------------------
+
+/// Whether `id`'s indexer resolves without a network round-trip on this
+/// machine right now (`$PATH` or tamga's own managed cache under `home`).
+/// This is exactly what passing `--offline` to the real `tamga index`
+/// invocation below enforces, so this probe's answer and the pipeline's
+/// own resolution can never disagree -- unlike a plain `find_on_path`
+/// check, it also credits indexers (e.g. `scip-go`, `scip-clang`) that
+/// live only in tamga's managed cache from an earlier `indexers install`,
+/// never on `$PATH` itself.
+fn indexer_offline_available(
+    id: tamga::indexers::IndexerId,
+    home: &tamga::workspace::Workspace,
+) -> bool {
+    let cfg = tamga::config::TamgaConfig::default();
+    let manifest = tamga::indexers::manifest::load().expect("embedded manifest parses");
+    tamga::indexers::resolve_cached(id, &cfg, home, &manifest).is_some()
+}
+
+/// M8: the full 9-family committed `fixtures/polyglot/` tree, indexed for
+/// real. Runs with `--offline` so "available" has one unambiguous meaning
+/// (resolves from `$PATH`/cache right now, never a network gamble the
+/// assertions below would have to guess at) against whatever real
+/// indexers this machine actually has -- no fake-indexer anywhere in this
+/// test. Every root whose indexer is offline-available must end Indexed
+/// with a repo-root-relative document under its own dir in the merged
+/// index; every other root must end Degraded with a non-empty, honest
+/// reason. Exit code is 0 (everything available indexed, nothing
+/// degraded) or 3 (a mix -- the expected case on a dev machine that
+/// doesn't have all 9 ecosystems' indexers installed). Uses the real
+/// `$TAMGA_HOME` (not a scratch tempdir like every other test in this
+/// file) specifically so previously `indexers install`-ed binaries in the
+/// managed cache count as available, matching "whatever tools exist on
+/// this machine" rather than a hermetically empty one.
+#[test]
+#[ignore = "requires TAMGA_LIVE=1; runs whatever real indexers this machine has"]
+fn live_polyglot_index_available_subset() {
+    if std::env::var("TAMGA_LIVE").is_err() {
+        eprintln!("skipping live test: set TAMGA_LIVE=1 to enable");
+        return;
+    }
+
+    use tamga::indexers::IndexerId;
+
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/polyglot");
+    let home = tamga::workspace::Workspace::resolve()
+        .expect("TAMGA_HOME or HOME must resolve to run this live test");
+    let out = tempdir().unwrap();
+
+    // One (fixture dir, indexer id) pair per family unit, in fixture order.
+    let families: &[(&str, IndexerId)] = &[
+        ("backend", IndexerId::ScipPython),
+        ("frontend", IndexerId::ScipTypescript),
+        ("gosvc", IndexerId::ScipGo),
+        ("rustlib", IndexerId::RustAnalyzer),
+        ("jvmapp", IndexerId::ScipJava),
+        ("dotnetapp", IndexerId::ScipDotnet),
+        ("rubyapp", IndexerId::ScipRuby),
+        ("phplib", IndexerId::ScipPhp),
+        ("native", IndexerId::ScipClang),
+    ];
+
+    let assert = tamga()
+        .args(["index"])
+        .arg(&repo)
+        .args(["--offline", "--output"])
+        .arg(out.path())
+        .assert();
+    let code = assert.get_output().status.code().unwrap_or(-1);
+    assert!(
+        code == 0 || code == 3,
+        "expected exit 0 (everything available indexed) or 3 (a mix); got {code}. stderr: {}",
+        String::from_utf8_lossy(&assert.get_output().stderr)
+    );
+
+    let report = read_report(out.path());
+    let merged_paths = doc_paths(&read_index(&out.path().join("index.scip")));
+
+    let mut outcomes = Vec::new();
+    for (dir, indexer_id) in families {
+        let root = root_by_dir(&report, dir);
+        let status = root["status"].as_str().unwrap_or("?");
+        let available = indexer_offline_available(*indexer_id, &home);
+        outcomes.push(format!(
+            "{dir:<10} indexer={:<16} available={available:<5} status={status}",
+            indexer_id.id_str()
+        ));
+
+        if available {
+            assert_eq!(
+                status,
+                "Indexed",
+                "{dir}: {} is offline-available but the root did not index; report: {root:#}",
+                indexer_id.id_str()
+            );
+            assert!(
+                merged_paths
+                    .iter()
+                    .any(|p| p.starts_with(&format!("{dir}/"))),
+                "{dir}: expected a repo-root-relative doc under {dir}/ in the merged index, \
+                 got: {merged_paths:?}"
+            );
+        } else {
+            assert_eq!(
+                status,
+                "Degraded",
+                "{dir}: {} is not offline-available, expected Degraded; report: {root:#}",
+                indexer_id.id_str()
+            );
+            let reason = root["reason"].as_str().unwrap_or("");
+            assert!(
+                !reason.is_empty(),
+                "{dir}: a degraded root must carry a non-empty, honest reason"
+            );
+        }
+    }
+
+    eprintln!("live_polyglot_index_available_subset outcomes (exit {code}):");
+    for line in &outcomes {
+        eprintln!("  {line}");
     }
 }

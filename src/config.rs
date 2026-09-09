@@ -303,6 +303,62 @@ mod tests {
         assert!(cfg.families.contains_key("python"));
     }
 
+    /// Cross-layer `[families.*]`/`[indexers.*]` merge: repo overrides home
+    /// on a shared key (the *whole* per-id table, not a deep field merge --
+    /// these tables are opaque as far as `config.rs` is concerned, only
+    /// families/indexers themselves interpret their contents), a
+    /// home-only key survives untouched, and a repo-only key is added --
+    /// exactly the semantics `apply_partial`'s `for (k, v) in
+    /// partial.families { base.families.insert(k, v) }` loop implements,
+    /// now pinned down by a test (previously only exercised indirectly via
+    /// single-key cases).
+    #[test]
+    fn families_and_indexers_tables_merge_cross_layer_per_top_level_key() {
+        let home = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        fs::write(
+            home.path().join("config.toml"),
+            "[families.python]\ninstall = \"auto\"\ntimeout = 60\n\
+             [families.go]\nbuild = \"full\"\n\
+             [indexers.scip-python]\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.path().join(".tamga.toml"),
+            // Overrides the whole `families.python` table (repo wins on the
+            // shared key -- home's `timeout = 60` does not survive inside
+            // it) and adds a new `indexers.scip-go` entry the home layer
+            // never mentioned.
+            "[families.python]\ninstall = \"never\"\n\
+             [indexers.scip-go]\npath = \"/opt/scip-go\"\n",
+        )
+        .unwrap();
+
+        let cfg =
+            load_effective_config(home.path(), Some(repo.path()), CliOverrides::default()).unwrap();
+
+        // Shared key: repo's table replaces home's entirely.
+        let python = cfg.families.get("python").unwrap().as_table().unwrap();
+        assert_eq!(python.get("install").unwrap().as_str(), Some("never"));
+        assert!(
+            !python.contains_key("timeout"),
+            "repo's families.python table replaces home's, it isn't deep-merged: {python:?}"
+        );
+
+        // Home-only key: untouched by the repo layer setting an unrelated
+        // family.
+        let go = cfg.families.get("go").unwrap().as_table().unwrap();
+        assert_eq!(go.get("build").unwrap().as_str(), Some("full"));
+
+        // Home-only indexer entry survives.
+        let scip_python = cfg.indexers.get("scip-python").unwrap().as_table().unwrap();
+        assert_eq!(scip_python.get("version").unwrap().as_str(), Some("1.0.0"));
+
+        // Repo-only indexer entry is added.
+        let scip_go = cfg.indexers.get("scip-go").unwrap().as_table().unwrap();
+        assert_eq!(scip_go.get("path").unwrap().as_str(), Some("/opt/scip-go"));
+    }
+
     #[test]
     fn missing_files_are_not_errors() {
         let home = tempdir().unwrap();

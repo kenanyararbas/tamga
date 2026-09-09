@@ -241,6 +241,15 @@ fn admit(
 /// always, or on any other non-`Success` status when that step's
 /// `stop_on_fail` is `true` (M2's default -- see `ExecStep::stop_on_fail`
 /// for the M3 nuance this enables).
+///
+/// Before *each* step (including the first), checks `cancel` and stops
+/// without spawning it at all if it's already set -- cancellation can
+/// arrive in the gap between two steps (the previous step's own
+/// `run_step` call already returned `Success` before the token flipped),
+/// and there is no reason to pay for spawning a process only to have its
+/// own poll loop notice the same cancellation a moment later. A step
+/// skipped this way is simply absent from the result, the same contract
+/// `run_tasks` already uses for a task cancelled before its first step.
 fn run_task_steps(
     task: &RootTask,
     executor: &dyn Executor,
@@ -248,6 +257,9 @@ fn run_task_steps(
 ) -> Vec<(String, StepResult)> {
     let mut results = Vec::with_capacity(task.steps.len());
     for step in &task.steps {
+        if cancel.is_cancelled() {
+            break;
+        }
         let result = executor.run_step(step, cancel);
         let status = result.status;
         results.push((step.id.clone(), result));
@@ -388,6 +400,52 @@ mod tests {
         assert_eq!(results[1].id, "b");
         assert!(!results[0].cancelled_before_start);
         assert!(!results[1].cancelled_before_start);
+    }
+
+    /// An executor that records every step it was actually asked to run,
+    /// and cancels `cancel` itself right after finishing whichever step id
+    /// is named in `cancel_after` -- simulating cancellation arriving in
+    /// the gap between two steps of the *same* task, not mid-step.
+    struct CancelAfterExecutor {
+        cancel_after: &'static str,
+        ran: Mutex<Vec<String>>,
+    }
+
+    impl Executor for CancelAfterExecutor {
+        fn run_step(&self, step: &ExecStep, cancel: &CancelToken) -> StepResult {
+            self.ran.lock().unwrap().push(step.id.clone());
+            if step.id == self.cancel_after {
+                cancel.cancel();
+            }
+            StepResult {
+                status: StepStatus::Success,
+                duration: Duration::from_millis(0),
+            }
+        }
+    }
+
+    #[test]
+    fn run_task_steps_does_not_spawn_a_step_when_cancelled_between_steps() {
+        let executor = CancelAfterExecutor {
+            cancel_after: "a",
+            ran: Mutex::new(Vec::new()),
+        };
+        let cancel = CancelToken::new();
+        let task = RootTask {
+            id: "t".to_string(),
+            weight: 1,
+            steps: vec![step("a"), step("b"), step("c")],
+        };
+
+        let results = run_task_steps(&task, &executor, &cancel);
+
+        // Only "a" ran (and, as a side effect, set `cancel`); "b" and "c"
+        // must never have been spawned at all -- not run-and-ignored, not
+        // run-and-recorded-as-Cancelled, simply absent.
+        assert_eq!(*executor.ran.lock().unwrap(), vec!["a".to_string()]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "a");
+        assert_eq!(results[0].1.status, StepStatus::Success);
     }
 
     #[test]

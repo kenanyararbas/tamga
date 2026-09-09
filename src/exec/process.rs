@@ -140,9 +140,13 @@ fn poll_until_done(child: &mut GroupChild, timeout: Duration, cancel: &CancelTok
             Ok(Some(status)) => return status_from_exit(status),
             Ok(None) => continue,
             Err(_) => {
-                // Waiting itself failed (rare, e.g. an OS error). Treat as
-                // an unknown failure rather than looping forever or
-                // panicking.
+                // Waiting itself failed (rare, e.g. an OS error). The
+                // child's actual state is now unknown -- it may still be
+                // alive -- so make a best-effort attempt to terminate the
+                // whole group before reporting an unknown failure, the
+                // same as the timeout/cancellation branches above, rather
+                // than risking an orphaned process tree.
+                terminate_group(child, TIMEOUT_KILL_GRACE);
                 return StepStatus::Failed { exit_code: None };
             }
         }

@@ -7,40 +7,20 @@
 //! tools/                      installed indexer binaries (M4+)
 //! ```
 
-use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
 use sha2::{Digest, Sha256};
+use thiserror::Error;
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum WorkspaceError {
-    Io(std::io::Error),
+    #[error("workspace I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("could not determine tamga home directory (no TAMGA_HOME or HOME)")]
     HomeUnresolvable,
-}
-
-impl fmt::Display for WorkspaceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            WorkspaceError::Io(e) => write!(f, "workspace I/O error: {e}"),
-            WorkspaceError::HomeUnresolvable => {
-                write!(
-                    f,
-                    "could not determine tamga home directory (no TAMGA_HOME or HOME)"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for WorkspaceError {}
-
-impl From<std::io::Error> for WorkspaceError {
-    fn from(e: std::io::Error) -> Self {
-        WorkspaceError::Io(e)
-    }
 }
 
 /// The tamga home directory and its well-known subdirectories.

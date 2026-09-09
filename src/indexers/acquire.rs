@@ -1081,6 +1081,12 @@ exit 0
         .unwrap();
         assert!(path.is_file());
         assert_eq!(std::fs::read(&path).unwrap(), b"binary-bytes");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_ne!(mode & 0o111, 0, "unzipped binary must be executable");
+        }
     }
 
     #[test]
@@ -1101,6 +1107,12 @@ exit 0
         )
         .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_ne!(mode & 0o111, 0, "plain binary asset must be executable");
+        }
     }
 
     // --- checksum verification ---------------------------------------------
@@ -1609,5 +1621,63 @@ exit 0
                 .join("scip-dotnet")
         );
         assert!(path.is_file());
+    }
+
+    // --- UreqFetcher download-limit regression -----------------------------
+
+    /// Spawns a one-shot loopback HTTP/1.1 server on `127.0.0.1` that reads
+    /// (and discards) a single request's headers, then writes `body` back
+    /// as a `200` response with an explicit `Content-Length`, then closes.
+    /// Returns the URL to fetch and a handle to join so the caller can
+    /// propagate any server-side panic -- never touches the real network,
+    /// so this stays safe for `cargo test`.
+    fn serve_once(body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            loop {
+                use std::io::BufRead;
+                let mut line = String::new();
+                let n = reader.read_line(&mut line).unwrap();
+                if n == 0 || line == "\r\n" || line == "\n" {
+                    break;
+                }
+            }
+            let mut stream = stream;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+            stream.flush().unwrap();
+        });
+        (format!("http://127.0.0.1:{port}/"), handle)
+    }
+
+    /// Regression test for a real bug found and fixed live in an earlier
+    /// task (no automated coverage existed at the time): `ureq`'s own
+    /// `Body::read_to_vec()` silently caps a response at 10MB unless told
+    /// otherwise, which made every real scip-clang binary download fail
+    /// outright before its checksum was ever even checked. 12MB safely
+    /// clears that old default cap while staying far under tamga's current
+    /// 256MB `MAX_DOWNLOAD_BYTES` and cheap to build/transfer in-process
+    /// over loopback -- proves `UreqFetcher` actually applies the raised
+    /// limit, not just that the constant was edited.
+    #[test]
+    fn ureq_fetcher_downloads_past_the_old_10mb_default_cap() {
+        let body = vec![0xABu8; 12 * 1024 * 1024];
+        let (url, server) = serve_once(body.clone());
+
+        let fetched = UreqFetcher
+            .fetch(&url)
+            .expect("a 12MB loopback download must succeed under the 256MB limit");
+
+        assert_eq!(fetched.len(), body.len());
+        assert_eq!(fetched, body);
+        server.join().unwrap();
     }
 }

@@ -694,6 +694,13 @@ fn base_root_report(plan: &RunnablePlan) -> RootReport {
     );
     report.indexer = Some(indexer_info(&plan.indexer));
     report.env_cache = Some(env_cache_label(plan.env_cache_hit));
+    // A non-fatal observation from resolution itself (currently: a config
+    // pin that exists but isn't executable) -- surfaced up front rather
+    // than only showing up later as an opaque spawn failure once the index
+    // step actually tries to run it.
+    if let Some(warning) = &plan.indexer.warning {
+        report.notes.push(warning.clone());
+    }
     report
 }
 

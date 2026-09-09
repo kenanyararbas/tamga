@@ -60,23 +60,40 @@ pub struct RootReport {
     pub status: RootStatus,
     pub reason: Option<String>,
     /// The resolved indexer, when one was found for this root.
+    ///
+    /// Added after `REPORT_VERSION` 1 shipped; `#[serde(default)]` so a
+    /// report produced by that first shape (or any other producer that
+    /// omits it) still deserializes instead of erroring on the missing key.
+    #[serde(default)]
     pub indexer: Option<IndexerInfo>,
-    /// `hit` | `miss`, when an env cache applied to this root.
+    /// `hit` | `miss`, when an env cache applied to this root. Post-v1
+    /// addition; see `indexer`'s note on `#[serde(default)]`.
+    #[serde(default)]
     pub env_cache: Option<String>,
-    /// Steps that actually ran, in order.
+    /// Steps that actually ran, in order. Post-v1 addition; see
+    /// `indexer`'s note on `#[serde(default)]`.
+    #[serde(default)]
     pub steps: Vec<StepReport>,
     /// Non-fatal observations (e.g. a best-effort install that failed, or a
-    /// salvaged index).
+    /// salvaged index). Post-v1 addition; see `indexer`'s note on
+    /// `#[serde(default)]`.
+    #[serde(default)]
     pub notes: Vec<String>,
     /// Permanent writes this root's processing made into the repo tree
     /// itself (as opposed to tamga's own workspace/cache), e.g. PHP's
     /// `composer install` populating `vendor/`. Empty for families that
-    /// never write into the repo.
+    /// never write into the repo. Post-v1 addition; see `indexer`'s note
+    /// on `#[serde(default)]`.
+    #[serde(default)]
     pub repo_writes: Vec<String>,
-    /// Index statistics, when an index was produced and parsed.
+    /// Index statistics, when an index was produced and parsed. Post-v1
+    /// addition; see `indexer`'s note on `#[serde(default)]`.
+    #[serde(default)]
     pub stats: Option<RootStats>,
     /// Documents whose path couldn't be mapped to the repo during rebasing
-    /// (kept anyway; see `merge::rebase`).
+    /// (kept anyway; see `merge::rebase`). Post-v1 addition; see
+    /// `indexer`'s note on `#[serde(default)]`.
+    #[serde(default)]
     pub unmapped_documents: u32,
 }
 
@@ -109,7 +126,10 @@ pub struct Totals {
     pub skipped: u32,
     pub cancelled: u32,
     /// Document paths that appeared in more than one root's index after
-    /// merging. Not a root-outcome count, so it never affects the exit code.
+    /// merging. Not a root-outcome count, so it never affects the exit
+    /// code. Post-v1 addition; `#[serde(default)]` so a `REPORT_VERSION` 1
+    /// report produced before this field existed still deserializes.
+    #[serde(default)]
     pub duplicate_documents: u32,
 }
 
@@ -309,5 +329,40 @@ mod tests {
         assert!(json.contains("\"report_version\":1"));
         let round_tripped: RunReport = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round_tripped, report);
+    }
+
+    /// A `RootReport`/`Totals` shaped exactly like the very first
+    /// `REPORT_VERSION` 1 shipped (`report_version` never actually bumped
+    /// since, per M6's precedent) -- missing every field this milestone or
+    /// later added (`indexer`, `env_cache`, `steps`, `notes`,
+    /// `repo_writes`, `stats`, `unmapped_documents`, `Totals::
+    /// duplicate_documents`). `#[serde(default)]` on all of them must make
+    /// this deserialize cleanly instead of erroring on missing keys.
+    #[test]
+    fn root_report_and_totals_deserialize_from_the_original_v1_shape() {
+        let root_json = r#"{
+            "id": "a",
+            "family": "python",
+            "dir": "a",
+            "status": "Indexed",
+            "reason": null
+        }"#;
+        let root: RootReport = serde_json::from_str(root_json).expect("v1-shaped root parses");
+        assert_eq!(root.indexer, None);
+        assert_eq!(root.env_cache, None);
+        assert!(root.steps.is_empty());
+        assert!(root.notes.is_empty());
+        assert!(root.repo_writes.is_empty());
+        assert_eq!(root.stats, None);
+        assert_eq!(root.unmapped_documents, 0);
+
+        let totals_json = r#"{
+            "indexed": 1,
+            "degraded": 0,
+            "skipped": 0,
+            "cancelled": 0
+        }"#;
+        let totals: Totals = serde_json::from_str(totals_json).expect("v1-shaped totals parse");
+        assert_eq!(totals.duplicate_documents, 0);
     }
 }
