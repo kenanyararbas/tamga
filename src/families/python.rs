@@ -144,9 +144,11 @@ impl Family for Python {
     }
 
     fn prepare(&self, root: &ResolvedRoot, ctx: &PrepareCtx) -> Vec<ExecStep> {
-        // Warm cache or an explicit --no-install means no env work: the
-        // index step just runs against whatever interpreter is available.
-        if ctx.env_cache_hit || ctx.no_install {
+        // Warm cache, an explicit --no-install, or --offline (uv/pip would
+        // need the network for the editable install) means no env work:
+        // the index step just runs against whatever interpreter is
+        // available.
+        if ctx.env_cache_hit || ctx.no_install || ctx.offline {
             return Vec::new();
         }
 

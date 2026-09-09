@@ -289,6 +289,7 @@ mod tests {
             config: cfg,
             indexer_argv0: PathBuf::from("scip-clang"),
             no_install: false,
+            offline: false,
             timeout_scale: 1.0,
             env_cache_hit: false,
         }

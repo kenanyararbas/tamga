@@ -34,6 +34,11 @@
 //!   --corrupt            write non-protobuf garbage to the output path
 //!                        instead of a valid index, to exercise the
 //!                        malformed-output degrade path.
+//!   --create-file <rel>  write an empty file at this path, relative to
+//!                        cwd (repeatable). Simulates a real indexer's own
+//!                        undisclosed repo write -- e.g. scip-typescript
+//!                        creating a bare `tsconfig.json` in a JS-only root
+//!                        that doesn't already have one.
 //!
 //! The real SCIP bytes are produced with the `scip` crate so the pipeline
 //! parses genuine protobuf output, not a sentinel.
@@ -56,6 +61,7 @@ fn main() {
     let mut index_output_path: Option<String> = None;
     let mut scip_docs: Vec<String> = Vec::new();
     let mut corrupt = false;
+    let mut create_files: Vec<String> = Vec::new();
 
     let mut i = 1;
     while i < args.len() {
@@ -88,6 +94,12 @@ fn main() {
                 }
             }
             "--corrupt" => corrupt = true,
+            "--create-file" => {
+                i += 1;
+                if let Some(path) = args.get(i) {
+                    create_files.push(path.clone());
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -108,6 +120,13 @@ fn main() {
     };
 
     record(&args, child_pid);
+
+    // Simulate an indexer's own undisclosed repo write (e.g.
+    // scip-typescript's bare tsconfig.json), before producing output --
+    // real indexers set up their working files before writing results too.
+    for rel in &create_files {
+        let _ = std::fs::write(rel, b"");
+    }
 
     // `--write-scip` wins over `--output` wins over `--index-output-path`
     // when more than one is present, so the exec-layer tests (which use

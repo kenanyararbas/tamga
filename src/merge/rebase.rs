@@ -56,8 +56,12 @@ fn rebase_path(original: &str, root_rel: &Path, repo: &Path) -> PathOutcome {
 
     // Rule 2: the rebased candidate exists on disk. Only a relative
     // candidate is a valid repo-relative path; an absolute original makes
-    // the join absolute, which rule 4 handles instead.
-    if candidate.is_relative() && repo.join(&candidate).exists() {
+    // the join absolute, which rule 4 handles instead. A candidate that
+    // still starts with `..` after root_rel absorbed what it could means
+    // the document escapes the repo root entirely -- never accept that as
+    // "mapped" just because `repo/../something` happens to exist on disk
+    // (e.g. a sibling directory); fall through toward unmapped instead.
+    if candidate.is_relative() && !candidate.starts_with("..") && repo.join(&candidate).exists() {
         return PathOutcome {
             path: to_slash(&candidate),
             mapped: true,
@@ -220,6 +224,34 @@ mod tests {
         let stats = rebase_index(&mut idx, Path::new("backend"), repo.path());
         assert_eq!(idx.documents[0].relative_path, "shared/util.py");
         assert_eq!(stats.unmapped_documents, 0);
+    }
+
+    // Rule 2 must NOT accept a candidate that still escapes the repo root
+    // (starts with `..`) as mapped, even when `repo/<candidate>` happens to
+    // exist on disk (e.g. a sibling directory outside the repo). It must
+    // fall through toward unmapped instead of writing an escaping path into
+    // the merged index as if it were a legitimate repo-relative one.
+    #[test]
+    fn rule2_rejects_an_escaping_candidate_even_if_the_target_exists_on_disk() {
+        let outer = tempfile::tempdir().unwrap();
+        let repo = outer.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        // Sits one level above the repo -- exactly what the escaping
+        // candidate ("../secret.txt") would resolve to on disk.
+        std::fs::write(outer.path().join("secret.txt"), b"").unwrap();
+
+        // root_rel absorbs one `..`, leaving one more that still escapes.
+        let mut idx = index_with(&["../../secret.txt"]);
+        let stats = rebase_index(&mut idx, Path::new("backend"), &repo);
+
+        assert_eq!(
+            idx.documents[0].relative_path, "../secret.txt",
+            "content is kept under the normalized (still-escaping) candidate, never dropped"
+        );
+        assert_eq!(
+            stats.unmapped_documents, 1,
+            "an escaping candidate must count as unmapped, not silently accepted"
+        );
     }
 
     #[test]

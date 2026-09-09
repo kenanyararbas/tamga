@@ -227,6 +227,19 @@ availability per platform is documented per-target in
 `assets/indexers.toml` and surfaced honestly at resolve time when a target
 has no prebuilt asset.
 
+## Roadmap / not in v1
+
+A few items discussed during planning were deliberately cut from v1 rather
+than half-implemented: the rest of the toolchain-pin matrix beyond what's
+shipped (Python's `requires-python` via `uv`, JS's `packageManager`/corepack
+plus an `engines` compatibility note, Ruby's `.ruby-version` degrade, and a
+`composer install --ignore-platform-req` retry for PHP), `tamga doctor`
+detecting per-family pin files at all (today it only checks ambient
+toolchain versions on `PATH`), and `[[roots]]`-style config overrides to
+force or suppress specific roots/families outside of `--only`/`--skip`.
+None of these are implemented, stubbed, or wired into the CLI; they're
+listed here so they're an explicit, tracked gap rather than a silent one.
+
 ## Development
 
 ```sh

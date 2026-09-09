@@ -152,10 +152,10 @@ impl Family for Ruby {
 }
 
 /// Whether `bundle install` is permitted this run: never under
-/// `--no-install`, otherwise governed by `[families.ruby] install`
-/// (`"auto"` default, `"never"` to opt out).
+/// `--no-install`/`--offline`, otherwise governed by `[families.ruby]
+/// install` (`"auto"` default, `"never"` to opt out).
 fn install_allowed(ctx: &PrepareCtx) -> bool {
-    if ctx.no_install {
+    if ctx.no_install || ctx.offline {
         return false;
     }
     let mode = ctx
@@ -254,6 +254,7 @@ mod tests {
             config: cfg,
             indexer_argv0: PathBuf::from("scip-ruby"),
             no_install,
+            offline: false,
             timeout_scale: 1.0,
             env_cache_hit,
         }
@@ -323,6 +324,26 @@ mod tests {
             false,
             true,
         );
+        assert!(Ruby.prepare(&test_root(), &ctx).is_empty());
+    }
+
+    #[test]
+    fn prepare_is_skipped_under_offline() {
+        let repo = tempdir().unwrap();
+        let env_dir = tempdir().unwrap();
+        let run_ws = tempdir().unwrap();
+        let cfg = crate::config::TamgaConfig::default();
+        let ctx = PrepareCtx {
+            repo: repo.path(),
+            env_dir: env_dir.path(),
+            run_workspace: run_ws.path(),
+            config: &cfg,
+            indexer_argv0: PathBuf::from("scip-ruby"),
+            no_install: false,
+            offline: true,
+            timeout_scale: 1.0,
+            env_cache_hit: false,
+        };
         assert!(Ruby.prepare(&test_root(), &ctx).is_empty());
     }
 

@@ -230,10 +230,10 @@ impl Family for JsTs {
 }
 
 /// Whether dependency installs are permitted this run: never under
-/// `--no-install`, otherwise governed by `[families.jsts] install`
-/// (`"auto"` default, `"never"` to opt out).
+/// `--no-install`/`--offline`, otherwise governed by `[families.jsts]
+/// install` (`"auto"` default, `"never"` to opt out).
 fn install_allowed(ctx: &PrepareCtx) -> bool {
-    if ctx.no_install {
+    if ctx.no_install || ctx.offline {
         return false;
     }
     let mode = ctx

@@ -127,11 +127,18 @@ impl Family for Php {
     }
 
     fn prepare(&self, root: &ResolvedRoot, ctx: &PrepareCtx) -> Vec<ExecStep> {
-        if ctx.env_cache_hit || !install_allowed(ctx) {
+        let root_abs = families::abs_root_dir(ctx.repo, &root.candidate.dir);
+        // NOT gated by the env cache (unlike JS/TS's node_modules probe,
+        // there's no cheap-and-correct way to trust a hit here): `vendor/`
+        // lives in the repo itself, so a git-cleaned repo with an otherwise
+        // warm env cache would silently skip the install scip-php needs to
+        // resolve anything. Probe `vendor/` directly instead, the same way
+        // JS/TS probes `node_modules/`.
+        let vendor_present = root_abs.join("vendor").is_dir();
+        if vendor_present || !install_allowed(ctx) {
             return Vec::new();
         }
 
-        let root_abs = families::abs_root_dir(ctx.repo, &root.candidate.dir);
         vec![ExecStep {
             id: COMPOSER_INSTALL_STEP_ID.to_string(),
             argv: vec![
@@ -169,11 +176,11 @@ impl Family for Php {
     }
 }
 
-/// Whether `composer install` is permitted this run: `--no-install` forces
-/// `never` regardless of config, otherwise governed by
+/// Whether `composer install` is permitted this run: `--no-install`/
+/// `--offline` force `never` regardless of config, otherwise governed by
 /// `[families.php] install` (`"auto"` default, `"never"` to opt out).
 fn install_allowed(ctx: &PrepareCtx) -> bool {
-    if ctx.no_install {
+    if ctx.no_install || ctx.offline {
         return false;
     }
     let mode = ctx
@@ -223,6 +230,7 @@ mod tests {
             config: cfg,
             indexer_argv0: PathBuf::from("scip-php"),
             no_install,
+            offline: false,
             timeout_scale: 1.0,
             env_cache_hit,
         }
@@ -277,6 +285,26 @@ mod tests {
     }
 
     #[test]
+    fn prepare_is_skipped_under_offline() {
+        let repo = tempdir().unwrap();
+        let env_dir = tempdir().unwrap();
+        let run_ws = tempdir().unwrap();
+        let cfg = crate::config::TamgaConfig::default();
+        let ctx = PrepareCtx {
+            repo: repo.path(),
+            env_dir: env_dir.path(),
+            run_workspace: run_ws.path(),
+            config: &cfg,
+            indexer_argv0: PathBuf::from("scip-php"),
+            no_install: false,
+            offline: true,
+            timeout_scale: 1.0,
+            env_cache_hit: false,
+        };
+        assert!(Php.prepare(&test_root(), &ctx).is_empty());
+    }
+
+    #[test]
     fn prepare_is_skipped_when_install_is_never() {
         let repo = tempdir().unwrap();
         let env_dir = tempdir().unwrap();
@@ -294,8 +322,15 @@ mod tests {
         assert!(Php.prepare(&test_root(), &ctx).is_empty());
     }
 
+    // A doc/code contradiction the review caught: `vendor/` lives in the
+    // repo itself, not tamga's env cache, so an env-cache hit alone must
+    // NOT skip `composer install` -- a git-cleaned repo with a warm cache
+    // would otherwise silently index without the autoload metadata
+    // scip-php needs. Regression for treating `env_cache_hit` as a proxy
+    // for "vendor/ is already there" the way it (correctly) does for other
+    // families' tamga-owned env dirs.
     #[test]
-    fn prepare_is_skipped_on_env_cache_hit() {
+    fn prepare_runs_composer_install_on_an_env_cache_hit_when_vendor_is_absent() {
         let repo = tempdir().unwrap();
         let env_dir = tempdir().unwrap();
         let run_ws = tempdir().unwrap();
@@ -306,6 +341,28 @@ mod tests {
             run_ws.path(),
             &cfg,
             true,
+            false,
+        );
+        let steps = Php.prepare(&test_root(), &ctx);
+        assert_eq!(steps.len(), 1, "vendor/ absent must still trigger install");
+        assert_eq!(steps[0].id, COMPOSER_INSTALL_STEP_ID);
+    }
+
+    // The actual, correct gate: probe `vendor/` directly (mirroring JS/TS's
+    // `node_modules/` probe), regardless of the env cache.
+    #[test]
+    fn prepare_is_skipped_when_vendor_already_present() {
+        let repo = tempdir().unwrap();
+        let env_dir = tempdir().unwrap();
+        let run_ws = tempdir().unwrap();
+        let cfg = crate::config::TamgaConfig::default();
+        std::fs::create_dir_all(repo.path().join("vendor")).unwrap();
+        let ctx = test_ctx(
+            repo.path(),
+            env_dir.path(),
+            run_ws.path(),
+            &cfg,
+            false,
             false,
         );
         assert!(Php.prepare(&test_root(), &ctx).is_empty());

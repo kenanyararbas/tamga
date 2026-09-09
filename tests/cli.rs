@@ -23,6 +23,32 @@ fn help_works() {
         .stdout(predicate::str::contains("doctor"));
 }
 
+// Every subcommand's own `--help` (clap's per-command doc comments) used
+// to say "(not yet implemented)" for detect/index/merge/indexers list/
+// install long after each shipped for real -- stale text a user would take
+// at face value. Regression: none of them should say that anymore, on the
+// top-level help or any subcommand's.
+#[test]
+fn help_no_longer_claims_unimplemented_commands() {
+    let assert_no_stale_text = |args: &[&str]| {
+        let output = tamga().args(args).assert().success();
+        let stdout = String::from_utf8_lossy(&output.get_output().stdout).into_owned();
+        assert!(
+            !stdout.contains("not yet implemented"),
+            "`tamga {}` help still claims 'not yet implemented':\n{stdout}",
+            args.join(" ")
+        );
+    };
+
+    assert_no_stale_text(&["--help"]);
+    assert_no_stale_text(&["detect", "--help"]);
+    assert_no_stale_text(&["index", "--help"]);
+    assert_no_stale_text(&["merge", "--help"]);
+    assert_no_stale_text(&["indexers", "--help"]);
+    assert_no_stale_text(&["indexers", "list", "--help"]);
+    assert_no_stale_text(&["indexers", "install", "--help"]);
+}
+
 #[test]
 fn doctor_runs_and_lists_git() {
     let home = tempdir().unwrap();

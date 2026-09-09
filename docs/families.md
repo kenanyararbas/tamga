@@ -29,14 +29,15 @@ matching those member globs. Otherwise a root subsumes only Weak children
 backend/frontend monorepo case). A Weak `requirements.txt` root whose
 subtree has zero `.py` files is dropped entirely.
 
-**Prepare.** Skipped outright on an env-cache hit or `--no-install`.
-Otherwise: (1) `uv venv <env>/venv` (or `python3 -m venv` if `uv` isn't on
-PATH) -- **hard**, a failure here degrades the root; (2) an editable
-install (`uv pip install --python <venv>/bin/python -e .`, or
-`-r requirements.txt` for a Weak root) -- **best-effort**, its failure is
-only a note. Unlike dotnet/jsts/php/ruby, Python reads **no**
-`[families.python]` config key at all -- there is no per-family way to opt
-out of the install step short of the global `--no-install` flag.
+**Prepare.** Skipped outright on an env-cache hit, `--no-install`, or
+`--offline` (the editable install needs the network). Otherwise: (1) `uv
+venv <env>/venv` (or `python3 -m venv` if `uv` isn't on PATH) -- **hard**,
+a failure here degrades the root; (2) an editable install (`uv pip install
+--python <venv>/bin/python -e .`, or `-r requirements.txt` for a Weak
+root) -- **best-effort**, its failure is only a note. Unlike
+dotnet/jsts/php/ruby, Python reads **no** `[families.python]` config key at
+all -- there is no per-family way to opt out of the install step short of
+the global `--no-install`/`--offline` flags.
 
 **Indexer.** `scip-python` (npm dist). Index step: `scip-python index . --output <out> --project-name <dir-name>`, cwd = the root.
 
@@ -56,19 +57,22 @@ evidence to the nearest ancestor root, or mints its own Project root if
 there is none.
 
 **Prepare.** Skipped on an env-cache hit, if `node_modules/` already
-exists, or under `--no-install`/`[families.jsts] install = "never"`.
-Otherwise a single **best-effort** install step, the exact command picked
-by the detected package manager: `pnpm install --frozen-lockfile`, `yarn
-install --frozen-lockfile`, `bun install`, `npm ci` (a lockfile present) or
-`npm install`.
+exists, or under `--no-install`/`--offline`/`[families.jsts] install =
+"never"`. Otherwise a single **best-effort** install step, the exact
+command picked by the detected package manager: `pnpm install
+--frozen-lockfile`, `yarn install --frozen-lockfile`, `bun install`, `npm
+ci` (a lockfile present) or `npm install`.
 
 **Indexer.** `scip-typescript` (npm dist). Index step:
 `scip-typescript index --cwd <root> --output <out>` (`--infer-tsconfig`
 appended for a JS-only root with no `tsconfig.json`).
 
-**Repo writes.** None disclosed -- `node_modules/` is the install step's
-only write, and is treated as ordinary (gitignored) build output, the same
-as every other family's dependency cache.
+**Repo writes.** `node_modules/` from the install step is treated as
+ordinary (gitignored) build output, not disclosed, the same as every other
+family's dependency cache. `"scip-typescript created tsconfig.json in the
+repo"` whenever the index step ran and a `tsconfig.json` exists afterward
+that wasn't there before the run -- scip-typescript writes a bare one into
+a JS-only root that lacks one to drive its own TypeScript setup.
 
 ## Go (`go`)
 
@@ -79,7 +83,10 @@ every other family's ancestor-wins default).
 
 **Prepare.** `go mod download` always runs (cheap, and only writes to the
 global Go module cache, not the repo) -- **best-effort**, not gated by the
-env cache or `--no-install`.
+env cache or `--no-install`. `--offline` is the one exception: it DOES
+suppress this step, since it genuinely touches the network (unlike every
+other family, where `--offline` and `--no-install` gate exactly the same
+steps).
 
 **Indexer.** `scip-go` (GitHub release). No macOS x86_64 asset published
 upstream (resolves to an honest "no prebuilt binary for this platform").
@@ -149,8 +156,8 @@ the prepare-time SDK-pin relax below.
 
 **Prepare.** `dotnet restore <target>` always runs (incremental, and
 writes `obj/` directly into the repo -- **not** gated by the env cache,
-only by `--no-install`/`[families.dotnet] install = "never"`) --
-**best-effort**. Separately, before the whole batch of tasks runs, tamga
+only by `--no-install`/`--offline`/`[families.dotnet] install = "never"`)
+-- **best-effort**. Separately, before the whole batch of tasks runs, tamga
 backs up and relaxes every distinct `global.json` a runnable .NET root
 uses (`sdk.rollForward = "latestMajor"` added, every other field
 preserved byte-for-byte) unless `[families.dotnet] relax_global_json =
@@ -179,7 +186,7 @@ engines live inside the app); sibling `Gemfile`s (neither an ancestor of
 the other) stay independent. A bare `*.gemspec` with no `Gemfile` above it
 is its own root.
 
-**Prepare.** Skipped on an env-cache hit, `--no-install`, or
+**Prepare.** Skipped on an env-cache hit, `--no-install`, `--offline`, or
 `[families.ruby] install = "never"`. Otherwise `bundle install`
 (`BUNDLE_PATH=<env>/bundle`) -- **best-effort**.
 
@@ -198,12 +205,14 @@ already in the walker's built-in ignore overlay, so a dependency's own
 `composer.json` unconditionally subsumes every nested one in its subtree
 -- PHP has no workspace concept.
 
-**Prepare.** Skipped under `--no-install`/`[families.php] install =
-"never"` (**not** gated by the env cache, since a hit still needs
-`vendor/` if it was ever cleaned). Otherwise `composer install
---no-interaction` -- **best-effort**, but its absence is expected to
-visibly degrade index quality: scip-php needs `vendor/`'s autoload
-metadata to resolve anything.
+**Prepare.** Skipped under `--no-install`/`--offline`/`[families.php]
+install = "never"`, or when `vendor/` already exists at the root (probed
+directly, the same way JS/TS probes `node_modules/` -- **not** gated by
+the env cache: `vendor/` lives in the repo itself, so a git-cleaned repo
+with an otherwise-warm cache still needs a fresh install). Otherwise
+`composer install --no-interaction` -- **best-effort**, but its absence is
+expected to visibly degrade index quality: scip-php needs `vendor/`'s
+autoload metadata to resolve anything.
 
 **Indexer.** `scip-php` (`davidrjenni/scip-php`, Composer dist -- no
 tagged binary releases at all). It has no output-path flag of its own: it
@@ -239,7 +248,7 @@ prefers an existing `compile_commands.json` at the root, else a
 deterministically-ordered shallow probe of `build*/` -> `out/` ->
 `cmake-build-*/`; otherwise the detected strategy drives real step
 generation, each gated on its own tool being on `PATH` (all suppressed
-under `--no-install`):
+under `--no-install`/`--offline`):
 - **CMake**: `cmake -S <root> -B <env>/build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`
   (hard) then `cmake --build <env>/build` (best-effort; skipped entirely
   when `[families.clang] build = "configure"`, default `"full"`).

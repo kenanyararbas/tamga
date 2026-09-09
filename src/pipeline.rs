@@ -52,6 +52,16 @@ struct RunnablePlan {
     /// `repo_writes` note recorded in `build_root_report` whenever the
     /// index step actually ran (i.e. actually reached the `rm -f`).
     php_index_scip_preexisted: bool,
+    /// `true` iff this is a JS/TS root and `<root>/tsconfig.json` already
+    /// existed *before* this run. scip-typescript writes a bare
+    /// `tsconfig.json` into a JS-only root that lacks one (needed to drive
+    /// its own TypeScript compiler setup) -- an undisclosed repo write the
+    /// plan never called out. Checked pre-run, same as PHP's
+    /// `php_index_scip_preexisted`, because it's the only point where "did
+    /// one already exist" is still observable; `build_root_report` compares
+    /// against post-run reality to decide whether the index step actually
+    /// created one.
+    jsts_tsconfig_preexisted: bool,
 }
 
 /// Entry point for `tamga index`. Returns the process exit code.
@@ -191,6 +201,7 @@ pub fn run_index(args: &IndexArgs) -> i32 {
             config: &config,
             indexer_argv0: resolved.path.clone(),
             no_install: args.no_install,
+            offline: args.offline,
             timeout_scale: config.run.timeout_scale,
             env_cache_hit,
         };
@@ -214,6 +225,15 @@ pub fn run_index(args: &IndexArgs) -> i32 {
                 .join("index.scip")
                 .is_file();
 
+        // Checked before any step runs, same reasoning as PHP's
+        // `index.scip` above: scip-typescript may write a bare
+        // `tsconfig.json` into the root as a side effect of indexing, so
+        // "did one already exist" is only observable right now.
+        let jsts_tsconfig_preexisted = family_id == FamilyId::JsTs
+            && families::abs_root_dir(&repo_abs, &root.candidate.dir)
+                .join("tsconfig.json")
+                .is_file();
+
         let mut steps = family.prepare(&root, &ctx);
         let mut index_step = family.index_step(&root, &out_path, &ctx);
         // Append any config-provided extra indexer args to the index step.
@@ -231,6 +251,7 @@ pub fn run_index(args: &IndexArgs) -> i32 {
             steps,
             weight: family.weight(),
             php_index_scip_preexisted,
+            jsts_tsconfig_preexisted,
         });
     }
 
@@ -264,6 +285,13 @@ pub fn run_index(args: &IndexArgs) -> i32 {
     let mut to_merge: Vec<Index> = Vec::new();
     for (plan, result) in plans.iter().zip(results) {
         let (report, rebased) = build_root_report(plan, result, &repo_abs);
+        let duration_ms: u64 = report.steps.iter().map(|s| s.duration_ms).sum();
+        tracing::info!(
+            root_id = %report.id,
+            status = ?report.status,
+            duration_ms,
+            "root finished"
+        );
         if let Some(index) = rebased {
             to_merge.push(index);
         }
@@ -357,6 +385,22 @@ fn build_root_report(
              (not written by tamga)"
                 .to_string(),
         );
+    }
+
+    // scip-typescript writes a bare `tsconfig.json` into a JS-only root
+    // that doesn't already have one (needed to drive its own TypeScript
+    // setup) -- an undisclosed repo write. Surfaced whenever the index step
+    // actually ran AND the file exists now but didn't before: comparing
+    // against the pre-run snapshot (rather than just "does it exist now")
+    // avoids crediting tamga with a tsconfig.json the repo already had.
+    if !plan.jsts_tsconfig_preexisted && result.steps.iter().any(|(id, _)| id == INDEX_STEP_ID) {
+        let tsconfig =
+            families::abs_root_dir(repo_abs, &plan.root.candidate.dir).join("tsconfig.json");
+        if tsconfig.is_file() {
+            report
+                .repo_writes
+                .push("scip-typescript created tsconfig.json in the repo".to_string());
+        }
     }
 
     // .NET's `dotnet restore` writes build intermediates (obj/) directly
@@ -743,11 +787,20 @@ fn base_root_report(plan: &RunnablePlan) -> RootReport {
 fn step_reports(plan: &RunnablePlan, results: &[(String, StepResult)]) -> Vec<StepReport> {
     results
         .iter()
-        .map(|(id, r)| StepReport {
-            id: id.clone(),
-            status: status_label(r.status).to_string(),
-            duration_ms: r.duration.as_millis() as u64,
-            log: step_log(plan, id),
+        .map(|(id, r)| {
+            tracing::info!(
+                root_id = %plan.root.id,
+                step_id = %id,
+                status = status_label(r.status),
+                duration_ms = r.duration.as_millis() as u64,
+                "step finished"
+            );
+            StepReport {
+                id: id.clone(),
+                status: status_label(r.status).to_string(),
+                duration_ms: r.duration.as_millis() as u64,
+                log: step_log(plan, id),
+            }
         })
         .collect()
 }

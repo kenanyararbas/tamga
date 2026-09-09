@@ -25,14 +25,36 @@ use tamga::indexers::IndexerId;
 use tamga::workspace::{CleanTarget, Workspace};
 
 fn main() -> anyhow::Result<ExitCode> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
-        .try_init()
-        .map_err(|e| anyhow::anyhow!("failed to initialize tracing: {e}"))?;
-
     let cli = Cli::parse();
+    // `index --log-json` is the only flag that decides the log format --
+    // parse the CLI before initializing tracing so its formatter can be
+    // picked up front, rather than switched mid-run.
+    let log_json = matches!(&cli.command, Command::Index(args) if args.log_json);
+    init_tracing(log_json)?;
+
     Ok(ExitCode::from(dispatch(cli) as u8))
+}
+
+/// Install the global tracing subscriber: human-readable `fmt` by default,
+/// or one JSON object per line (`tracing_subscriber`'s `json` feature) under
+/// `tamga index --log-json`, so log lines are machine-parseable the way the
+/// flag promises. Both write to stderr and honor `RUST_LOG` identically --
+/// only the output encoding differs.
+fn init_tracing(json: bool) -> anyhow::Result<()> {
+    let filter = tracing_subscriber::EnvFilter::from_default_env();
+    let result = if json {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .try_init()
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .try_init()
+    };
+    result.map_err(|e| anyhow::anyhow!("failed to initialize tracing: {e}"))
 }
 
 fn dispatch(cli: Cli) -> i32 {

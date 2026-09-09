@@ -157,16 +157,17 @@ pub fn resolve(
 }
 
 /// The prepare-phase steps for an already-[`resolve`]d `compdb`. Empty for
-/// `Existing` (nothing to build) and under `--no-install` (compdb
-/// generation is itself a build, gated the same way every other family
-/// gates its install/build steps).
+/// `Existing` (nothing to build) and under `--no-install`/`--offline`
+/// (compdb generation is itself a build, gated the same way every other
+/// family gates its install/build steps; CMake/Meson's configure step in
+/// particular can reach out to the network for dependencies).
 pub fn prepare_steps(
     compdb: &Compdb,
     root_id: &str,
     root_dir: &Path,
     ctx: &PrepareCtx,
 ) -> Vec<ExecStep> {
-    if ctx.no_install {
+    if ctx.no_install || ctx.offline {
         return Vec::new();
     }
     let root_abs = families::abs_root_dir(ctx.repo, root_dir);
@@ -384,6 +385,7 @@ mod tests {
             config: cfg,
             indexer_argv0: PathBuf::from("scip-clang"),
             no_install,
+            offline: false,
             timeout_scale: 1.0,
             env_cache_hit: false,
         }
@@ -813,6 +815,23 @@ mod tests {
         let run_ws = tempdir().unwrap();
         let cfg = TamgaConfig::default();
         let c = ctx(repo.path(), env_dir.path(), run_ws.path(), &cfg, true);
+        let compdb = Compdb::Cmake {
+            path: env_dir.path().join("build/compile_commands.json"),
+        };
+        assert!(prepare_steps(&compdb, "root+clang", Path::new(""), &c).is_empty());
+    }
+
+    #[test]
+    fn prepare_steps_offline_suppresses_every_strategy() {
+        // CMake/Meson's configure step can reach the network for
+        // dependencies, so --offline must gate compdb generation the same
+        // way --no-install does.
+        let repo = tempdir().unwrap();
+        let env_dir = tempdir().unwrap();
+        let run_ws = tempdir().unwrap();
+        let cfg = TamgaConfig::default();
+        let mut c = ctx(repo.path(), env_dir.path(), run_ws.path(), &cfg, false);
+        c.offline = true;
         let compdb = Compdb::Cmake {
             path: env_dir.path().join("build/compile_commands.json"),
         };

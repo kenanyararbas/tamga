@@ -15,16 +15,16 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Detect language/build families in a repo (not yet implemented).
+    /// Detect language/build families in a repo.
     Detect(DetectArgs),
-    /// Run detection, build prep, and indexing across a repo (not yet implemented).
+    /// Run detection, build prep, and indexing across a repo.
     Index(IndexArgs),
     /// Manage SCIP indexer binaries.
     Indexers {
         #[command(subcommand)]
         action: IndexersAction,
     },
-    /// Merge two SCIP indexes (not yet implemented).
+    /// Merge two SCIP indexes.
     Merge(MergeArgs),
     /// Check the local toolchain for tools tamga's indexers rely on.
     Doctor(DoctorArgs),
@@ -60,10 +60,18 @@ pub struct IndexArgs {
     /// Number of roots to process in parallel.
     #[arg(long)]
     pub jobs: Option<u32>,
-    /// Don't touch the network (fail rather than download/install anything).
+    /// Don't touch the network: an indexer that isn't already pinned/cached
+    /// fails to resolve (its root degrades) instead of being downloaded,
+    /// and every family's network-touching dependency/build-prep step
+    /// (venv/npm/yarn/pnpm/bun install, bundle install, composer install,
+    /// dotnet restore, go mod download, cmake/meson configure+build) is
+    /// skipped the same way `--no-install` skips it.
     #[arg(long)]
     pub offline: bool,
-    /// Never install missing indexers, even if allowed to.
+    /// Never run per-family dependency/build-prep installs (venv/npm/
+    /// bundle/composer/dotnet restore/compdb generation). Does NOT affect
+    /// indexer downloads -- an indexer still installs on a cache miss
+    /// unless `--offline` is also given.
     #[arg(long = "no-install")]
     pub no_install: bool,
     /// Directory to write merged output into. Defaults to the run workspace.
@@ -88,9 +96,9 @@ pub struct IndexArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum IndexersAction {
-    /// List known/installed indexers (not yet implemented).
+    /// List known/installed indexers.
     List(IndexersListArgs),
-    /// Install one or more indexers (not yet implemented).
+    /// Install one or more indexers.
     Install(IndexersInstallArgs),
 }
 

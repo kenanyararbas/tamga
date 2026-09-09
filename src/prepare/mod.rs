@@ -49,6 +49,16 @@ pub struct PrepareCtx<'a> {
     pub indexer_argv0: PathBuf,
     /// `--no-install`: never run dependency-install steps.
     pub no_install: bool,
+    /// `--offline`: never touch the network. Indexer acquisition is a
+    /// separate path (`indexers::ResolveOptions::offline`) that degrades a
+    /// root outright on a cache miss; here it additionally suppresses every
+    /// family's network-touching dependency/prep step the same way
+    /// `no_install` does -- families that gate on `no_install` should gate
+    /// on `offline` too. Go's `go mod download` is the one step that is
+    /// deliberately NOT gated by `no_install` (cheap, best-effort, writes
+    /// only to the global module cache) but IS gated by `offline`, since it
+    /// still genuinely hits the network.
+    pub offline: bool,
     pub timeout_scale: f64,
     /// Whether this root's env cache is already warm (marker present).
     pub env_cache_hit: bool,

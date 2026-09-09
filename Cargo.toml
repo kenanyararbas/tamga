@@ -38,7 +38,7 @@ tar = "0.4.46"
 thiserror = "2.0.20"
 toml = "1.1.5"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 ureq = "3.4.1"
 wait-timeout = "0.2.1"
 zip = "8.6.0"

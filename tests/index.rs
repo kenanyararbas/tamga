@@ -528,6 +528,51 @@ fn no_install_does_not_warm_the_env_cache() {
     );
 }
 
+// 7b. `--offline` must suppress every family's network-touching prep step
+//     (not just indexer acquisition): no venv for Python, no deps-install
+//     for JS/TS, no go-mod-download for Go. Regression for `--offline`
+//     documenting network isolation it didn't actually provide -- prep
+//     steps used to run (and hit the network) regardless of the flag. PATH
+//     is emptied so a real uv/npm/go being invoked would fail loudly
+//     rather than silently succeeding.
+#[test]
+fn offline_skips_dependency_prep_steps_across_families() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let out = tempdir().unwrap();
+    build_polyglot(repo.path());
+    write_polyglot_pin(repo.path());
+
+    let empty_path = tempdir().unwrap();
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .env("PATH", empty_path.path())
+        .args(["index"])
+        .arg(repo.path())
+        .args(["--offline", "--output"])
+        .arg(out.path())
+        .assert()
+        .code(0);
+
+    let report = read_report(out.path());
+    let python_root = root_by_dir(&report, "backend");
+    let jsts_root = root_by_dir(&report, "frontend");
+    let go_root = root_by_dir(&report, "gosvc");
+
+    assert!(!has_step(python_root, "venv"), "python: {python_root:#}");
+    assert!(!has_step(jsts_root, "deps-install"), "jsts: {jsts_root:#}");
+    assert!(
+        !has_step(go_root, "go-mod-download"),
+        "go (--offline must gate it even though --no-install deliberately doesn't): {go_root:#}"
+    );
+
+    // The three fake-pinned indexers still ran and produced output -- proof
+    // this is prep-step suppression, not a wholesale degrade.
+    assert_eq!(python_root["status"], "Indexed", "python: {python_root:#}");
+    assert_eq!(jsts_root["status"], "Indexed", "jsts: {jsts_root:#}");
+    assert_eq!(go_root["status"], "Indexed", "go: {go_root:#}");
+}
+
 // 8. Malformed per-root output isolates to its own root.
 #[test]
 fn malformed_output_degrades_only_its_root() {
@@ -1024,6 +1069,90 @@ fn php_install_step_id() -> &'static str {
     "composer-install"
 }
 
+// PHP: `vendor/` lives in the repo, not tamga's env cache, so an
+// env-cache hit alone must NOT skip `composer install` -- a `git clean
+// -xdf` between runs (vendor/ gone, tamga's env-cache marker still warm)
+// must still trigger a fresh install, the same way JS/TS probes
+// `node_modules/` directly rather than trusting the cache hit. Regression
+// for a code/doc contradiction where the code skipped on env_cache_hit
+// but the docs (correctly) said it never should.
+#[test]
+fn m8_php_vendor_probe_reruns_composer_install_on_env_cache_hit_after_vendor_removed() {
+    let fake = fake_indexer();
+    let fake = fake.to_str().unwrap();
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    fs::write(
+        repo.path().join("composer.json"),
+        "{\"name\": \"acme/app\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join(".tamga.toml"),
+        format!("[indexers.scip-php]\npath = \"{fake}\"\n"),
+    )
+    .unwrap();
+
+    // A fake `composer` that actually creates vendor/, so run 1 leaves the
+    // repo in the state a real install would.
+    let path_dir = tempdir().unwrap();
+    fs::write(
+        path_dir.path().join("composer"),
+        "#!/bin/sh\nmkdir -p vendor\nexit 0\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            path_dir.path().join("composer"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    let path_val = format!("{}:/bin:/usr/bin", path_dir.path().display());
+
+    // Run 1: cold cache -> composer install runs, creates vendor/.
+    let out1 = tempdir().unwrap();
+    let _ = tamga()
+        .env("TAMGA_HOME", home.path())
+        .env("PATH", &path_val)
+        .args(["index"])
+        .arg(repo.path())
+        .arg("--output")
+        .arg(out1.path())
+        .assert();
+    let r1 = read_report(out1.path());
+    let root1 = root_by_dir(&r1, ".");
+    assert_eq!(root1["env_cache"], "miss", "run1: {root1:#}");
+    assert!(has_step(root1, php_install_step_id()), "run1: {root1:#}");
+    assert!(repo.path().join("vendor").is_dir());
+
+    // Simulate `git clean -xdf`: vendor/ is gone, but tamga's env-cache
+    // marker (a different directory entirely) is still warm.
+    fs::remove_dir_all(repo.path().join("vendor")).unwrap();
+
+    // Run 2: env-cache hit, vendor/ absent -> composer install must run
+    // again. The bug this regresses would skip it on the cache hit alone.
+    let out2 = tempdir().unwrap();
+    let _ = tamga()
+        .env("TAMGA_HOME", home.path())
+        .env("PATH", &path_val)
+        .args(["index"])
+        .arg(repo.path())
+        .arg("--output")
+        .arg(out2.path())
+        .assert();
+    let r2 = read_report(out2.path());
+    let root2 = root_by_dir(&r2, ".");
+    assert_eq!(root2["env_cache"], "hit", "run2: {root2:#}");
+    assert!(
+        has_step(root2, php_install_step_id()),
+        "run2 must still run composer install when vendor/ is absent, even on an env-cache hit: {root2:#}"
+    );
+    assert!(repo.path().join("vendor").is_dir());
+}
+
 // 15. PHP move-wrap: scip-php only ever writes `./index.scip` into its
 //     cwd, so the index step wraps it and moves that file out to the real
 //     per-root output path. Proven end to end: the merged index has the
@@ -1145,6 +1274,164 @@ fn m8_php_preexisting_index_scip_is_disclosed_as_a_repo_write() {
     assert!(!repo.path().join("index.scip").exists());
     let index = read_index(&out.path().join("index.scip"));
     assert_eq!(doc_paths(&index), vec!["app.php".to_string()]);
+}
+
+// JS/TS: scip-typescript may write a bare tsconfig.json into a JS-only
+// root that lacks one (to drive its own TypeScript setup) -- an
+// undisclosed repo write the plan never called out. `fake-indexer
+// --create-file` simulates that real behavior; the pipeline must disclose
+// it as a repo_writes note whenever the index step actually created one.
+#[test]
+fn m8_jsts_tsconfig_created_by_indexer_is_disclosed_as_a_repo_write() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let out = tempdir().unwrap();
+    fs::write(repo.path().join("package.json"), "{\"name\": \"app\"}\n").unwrap();
+    fs::write(repo.path().join("index.js"), "export const x = 1;\n").unwrap();
+
+    let fake = fake_indexer();
+    let fake = fake.to_str().unwrap();
+    fs::write(
+        repo.path().join(".tamga.toml"),
+        format!(
+            "[indexers.scip-typescript]\npath = \"{fake}\"\nargs = [\"--create-file\", \"tsconfig.json\", \"--scip-doc\", \"index.js\"]\n"
+        ),
+    )
+    .unwrap();
+
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .args(["index"])
+        .arg(repo.path())
+        .args(["--no-install", "--output"])
+        .arg(out.path())
+        .assert()
+        .code(0);
+
+    let report = read_report(out.path());
+    let root = root_by_dir(&report, ".");
+    assert_eq!(root["status"], "Indexed", "root: {root:#}");
+    let writes: Vec<&str> = root["repo_writes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        writes,
+        vec!["scip-typescript created tsconfig.json in the repo"]
+    );
+    assert!(repo.path().join("tsconfig.json").is_file());
+}
+
+// The counterpart: a tsconfig.json that already existed before the run
+// must NOT be misattributed to tamga just because it's still there
+// afterward -- only a *newly appearing* one is disclosed.
+#[test]
+fn m8_jsts_preexisting_tsconfig_is_not_disclosed_as_a_repo_write() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let out = tempdir().unwrap();
+    fs::write(repo.path().join("package.json"), "{\"name\": \"app\"}\n").unwrap();
+    fs::write(repo.path().join("tsconfig.json"), "{}\n").unwrap();
+    fs::write(repo.path().join("index.ts"), "export const x = 1;\n").unwrap();
+
+    let fake = fake_indexer();
+    let fake = fake.to_str().unwrap();
+    fs::write(
+        repo.path().join(".tamga.toml"),
+        format!(
+            "[indexers.scip-typescript]\npath = \"{fake}\"\nargs = [\"--scip-doc\", \"index.ts\"]\n"
+        ),
+    )
+    .unwrap();
+
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .args(["index"])
+        .arg(repo.path())
+        .args(["--no-install", "--output"])
+        .arg(out.path())
+        .assert()
+        .code(0);
+
+    let report = read_report(out.path());
+    let root = root_by_dir(&report, ".");
+    assert!(
+        root["repo_writes"].as_array().unwrap().is_empty(),
+        "root: {root:#}"
+    );
+}
+
+// `--log-json` was defined but never read (a silent no-op): the plan
+// promised structured logging, but nothing wired the flag to anything.
+// Regression: with it set, tamga's own stderr (children's stdout/stderr go
+// to per-step log files, never inherited -- see exec::process) is one JSON
+// object per line (tracing_subscriber's `json` formatter), including at
+// least one per-root and one per-step event carrying id/status/duration.
+#[test]
+fn m8_log_json_emits_structured_json_lines_to_stderr() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let out = tempdir().unwrap();
+    fs::write(
+        repo.path().join("go.mod"),
+        "module example.com/x\n\ngo 1.18\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join("main.go"),
+        "package main\n\nfunc main() {}\n",
+    )
+    .unwrap();
+
+    let fake = fake_indexer();
+    let fake = fake.to_str().unwrap();
+    fs::write(
+        repo.path().join(".tamga.toml"),
+        format!("[indexers.scip-go]\npath = \"{fake}\"\nargs = [\"--scip-doc\", \"main.go\"]\n"),
+    )
+    .unwrap();
+
+    let assert = tamga()
+        .env("TAMGA_HOME", home.path())
+        .env("RUST_LOG", "tamga=info")
+        .args(["index"])
+        .arg(repo.path())
+        .args(["--no-install", "--offline", "--log-json", "--output"])
+        .arg(out.path())
+        .assert()
+        .code(0);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).unwrap();
+
+    let events: Vec<Value> = stderr
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            serde_json::from_str(l)
+                .unwrap_or_else(|e| panic!("non-JSON stderr line under --log-json: {e}\nline: {l}"))
+        })
+        .collect();
+    assert!(
+        !events.is_empty(),
+        "expected at least one JSON log line on stderr, got:\n{stderr}"
+    );
+
+    let message_of = |e: &Value| -> String {
+        e["fields"]["message"]
+            .as_str()
+            .or_else(|| e["message"].as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert!(
+        events.iter().any(|e| message_of(e) == "root finished"),
+        "events: {events:#?}"
+    );
+    assert!(
+        events.iter().any(|e| message_of(e) == "step finished"),
+        "events: {events:#?}"
+    );
 }
 
 // ---- M6: JVM + .NET pipeline integration -------------------------------

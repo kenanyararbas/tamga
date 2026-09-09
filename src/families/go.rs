@@ -114,7 +114,13 @@ impl Family for Go {
     fn prepare(&self, root: &ResolvedRoot, ctx: &PrepareCtx) -> Vec<ExecStep> {
         // `go mod download` is cheap and writes only to the global module
         // cache, so it runs unconditionally (not gated by the env cache or
-        // --no-install); its failure is a note, never fatal.
+        // --no-install); its failure is a note, never fatal. It genuinely
+        // hits the network though, so --offline (unlike --no-install) DOES
+        // suppress it -- the one family step for which those two flags
+        // disagree.
+        if ctx.offline {
+            return Vec::new();
+        }
         let root_abs = families::abs_root_dir(ctx.repo, &root.candidate.dir);
         vec![ExecStep {
             id: "go-mod-download".to_string(),
@@ -230,6 +236,82 @@ fn relative<'a>(child: &'a Path, ancestor: &Path) -> &'a Path {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_root() -> ResolvedRoot {
+        ResolvedRoot {
+            id: "root+go".to_string(),
+            candidate: RootCandidate {
+                family: FamilyId::Go,
+                dir: PathBuf::new(),
+                strength: RootStrength::Project,
+                evidence: Vec::new(),
+                member_patterns: Vec::new(),
+                meta: FamilyMeta::Go,
+            },
+            subsumed: Vec::new(),
+        }
+    }
+
+    fn test_ctx<'a>(
+        repo: &'a Path,
+        env_dir: &'a Path,
+        run_ws: &'a Path,
+        cfg: &'a crate::config::TamgaConfig,
+        no_install: bool,
+        offline: bool,
+    ) -> PrepareCtx<'a> {
+        PrepareCtx {
+            repo,
+            env_dir,
+            run_workspace: run_ws,
+            config: cfg,
+            indexer_argv0: PathBuf::from("scip-go"),
+            no_install,
+            offline,
+            timeout_scale: 1.0,
+            env_cache_hit: false,
+        }
+    }
+
+    // `go mod download` is deliberately NOT gated by --no-install (cheap,
+    // best-effort, writes only to the global module cache) -- regression
+    // for that documented exception surviving the --offline change below.
+    #[test]
+    fn prepare_runs_go_mod_download_even_under_no_install() {
+        let repo = tempfile::tempdir().unwrap();
+        let env_dir = tempfile::tempdir().unwrap();
+        let run_ws = tempfile::tempdir().unwrap();
+        let cfg = crate::config::TamgaConfig::default();
+        let ctx = test_ctx(
+            repo.path(),
+            env_dir.path(),
+            run_ws.path(),
+            &cfg,
+            true,
+            false,
+        );
+        assert_eq!(Go.prepare(&test_root(), &ctx).len(), 1);
+    }
+
+    // Unlike --no-install, --offline DOES gate it: `go mod download`
+    // genuinely touches the network, so promising "don't touch the
+    // network" must actually suppress this step.
+    #[test]
+    fn prepare_is_skipped_under_offline() {
+        let repo = tempfile::tempdir().unwrap();
+        let env_dir = tempfile::tempdir().unwrap();
+        let run_ws = tempfile::tempdir().unwrap();
+        let cfg = crate::config::TamgaConfig::default();
+        let ctx = test_ctx(
+            repo.path(),
+            env_dir.path(),
+            run_ws.path(),
+            &cfg,
+            false,
+            true,
+        );
+        assert!(Go.prepare(&test_root(), &ctx).is_empty());
+    }
 
     #[test]
     fn parses_block_use_directives() {
