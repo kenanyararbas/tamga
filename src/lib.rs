@@ -4,3 +4,5 @@
 //! binary (`main.rs`) that parses the CLI and dispatches into it. Keeping
 //! the logic in the library makes it directly testable without shelling
 //! out to the compiled binary for everything.
+
+pub mod report;
