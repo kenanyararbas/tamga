@@ -2,6 +2,10 @@
 name = "tamga"
 version = "0.1.0"
 edition = "2024"
+authors = ["tamga contributors"]
+description = "A standalone SCIP orchestrator: detect language/build families, prepare, run the right indexer, and merge into one repo-relative SCIP index."
+license = "MIT"
+repository = "https://github.com/kenanyararbas/tamga"
 
 [dependencies]
 anyhow = "1.0.104"
