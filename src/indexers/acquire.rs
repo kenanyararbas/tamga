@@ -168,7 +168,7 @@ pub fn install(
         DistKind::GithubRelease { repo, targets } => {
             install_github_release(repo, targets, version, &staging_dir, bin_name, fetcher)
         }
-        DistKind::Npm { package } => install_npm(package, version, &staging_dir),
+        DistKind::Npm { package } => install_npm(package, version, &staging_dir, INSTALL_TIMEOUT),
     };
 
     if let Err(e) = outcome {
@@ -301,7 +301,16 @@ fn set_executable(_path: &Path) -> Result<(), AcquireError> {
     Ok(())
 }
 
-fn install_npm(package: &str, version: &str, staging_dir: &Path) -> Result<(), AcquireError> {
+/// `timeout` is a parameter (rather than always [`INSTALL_TIMEOUT`]) so
+/// tests can exercise the real kill-on-timeout path against a fake,
+/// slow "npm" without waiting the real 10-minute budget; production's
+/// only call site (in [`install`]) always passes [`INSTALL_TIMEOUT`].
+fn install_npm(
+    package: &str,
+    version: &str,
+    staging_dir: &Path,
+    timeout: Duration,
+) -> Result<(), AcquireError> {
     if super::find_on_path("npm").is_none() {
         return Err(AcquireError::NpmMissing);
     }
@@ -311,7 +320,7 @@ fn install_npm(package: &str, version: &str, staging_dir: &Path) -> Result<(), A
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let status = run_with_timeout(cmd, INSTALL_TIMEOUT)?;
+    let status = run_with_timeout(cmd, timeout)?;
     if !status.success() {
         return Err(AcquireError::CommandFailed {
             program,
@@ -336,9 +345,11 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<ExitStatus, A
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::indexers::test_support::path_guard;
     use std::io::Write as _;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
     use tempfile::tempdir;
 
     // --- fixtures --------------------------------------------------------
@@ -377,6 +388,55 @@ mod tests {
 
     fn sha256_hex(bytes: &[u8]) -> String {
         hex::encode(Sha256::digest(bytes))
+    }
+
+    fn write_executable(path: &Path, contents: &[u8]) {
+        std::fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// Writes a fake `npm` onto `dir` (meant to be the sole entry on a
+    /// scratch `$PATH`) that, on success, creates the
+    /// `node_modules/.bin/<bin_name>` layout a real `npm install` would --
+    /// parsed out of its own `--prefix <dir>` argument, exactly like
+    /// `npm_install_argv` constructs it -- so `install()`'s post-install
+    /// `existing_binary` check finds a real, executable file.
+    fn write_fake_npm_success(dir: &Path, bin_name: &str) {
+        let script = format!(
+            "#!/bin/sh
+prefix=\"\"
+while [ $# -gt 0 ]; do
+case \"$1\" in
+--prefix) prefix=\"$2\"; shift 2 ;;
+*) shift ;;
+esac
+done
+mkdir -p \"$prefix/node_modules/.bin\"
+printf '#!/bin/sh\\necho 1.2.3\\n' > \"$prefix/node_modules/.bin/{bin_name}\"
+chmod +x \"$prefix/node_modules/.bin/{bin_name}\"
+exit 0
+"
+        );
+        write_executable(&dir.join("npm"), script.as_bytes());
+    }
+
+    /// A fake `npm` that always fails with `exit_code`, writing nothing --
+    /// simulates a real `npm install` failure (bad package name, network
+    /// error inside npm itself, etc.).
+    fn write_fake_npm_failure(dir: &Path, exit_code: i32) {
+        let script = format!("#!/bin/sh\nexit {exit_code}\n");
+        write_executable(&dir.join("npm"), script.as_bytes());
+    }
+
+    /// A fake `npm` that sleeps well past any short test timeout, so the
+    /// timeout path has something real to kill.
+    fn write_fake_npm_sleep(dir: &Path, seconds: u64) {
+        let script = format!("#!/bin/sh\nsleep {seconds}\nexit 0\n");
+        write_executable(&dir.join("npm"), script.as_bytes());
     }
 
     /// A fetcher that serves fixed bytes for one URL and counts calls, so
@@ -704,5 +764,144 @@ mod tests {
             .filter(|n| n != "1.0.0")
             .collect();
         assert!(leftovers.is_empty(), "leftover entries: {leftovers:?}");
+    }
+
+    // --- npm execution path (fake npm on a scratch PATH, never the real npm) -
+
+    fn npm_dist(package: &str) -> DistKind {
+        DistKind::Npm {
+            package: package.to_string(),
+        }
+    }
+
+    /// Points `$PATH` at `dir` for the duration of `f`, restoring the prior
+    /// value (or removing it if there wasn't one) before returning --
+    /// mirrors the pattern in `indexers::tests::path_beats_cache`. `$PATH`
+    /// is process-global, so callers must hold [`path_guard`] first.
+    /// `dir` (holding the fake `npm`) goes first, so `find_on_path("npm")`
+    /// and the real exec both resolve to it well ahead of any real `npm`
+    /// on the machine's normal PATH -- but `/bin:/usr/bin` stays reachable
+    /// behind it, because the fake `npm` scripts themselves shell out to
+    /// real coreutils (`mkdir`, `chmod`, `sleep`); a fully-scrubbed PATH
+    /// would make those "command not found" instead of exercising the
+    /// success/failure/timeout behavior under test.
+    fn with_scratch_path<R>(dir: &Path, f: impl FnOnce() -> R) -> R {
+        let old = std::env::var_os("PATH");
+        let scratch_path = format!("{}:/bin:/usr/bin", dir.display());
+        unsafe { std::env::set_var("PATH", scratch_path) };
+        let result = f();
+        match old {
+            Some(v) => unsafe { std::env::set_var("PATH", v) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+        result
+    }
+
+    #[test]
+    fn install_npm_success_resolves_the_installed_binary() {
+        let _guard = path_guard();
+        let path_dir = tempdir().unwrap();
+        write_fake_npm_success(path_dir.path(), "my-py-indexer");
+        let tmp = tempdir().unwrap();
+        let dist = npm_dist("@acme/my-py-indexer");
+
+        let result = with_scratch_path(path_dir.path(), || {
+            install(
+                "my-py-indexer",
+                &dist,
+                "1.0.0",
+                tmp.path(),
+                "my-py-indexer",
+                &FakeFetcher::ok(Vec::new()),
+            )
+        });
+
+        let path = result.expect("fake npm install should succeed");
+        assert_eq!(
+            path,
+            tmp.path()
+                .join("my-py-indexer")
+                .join("1.0.0")
+                .join("node_modules")
+                .join(".bin")
+                .join("my-py-indexer")
+        );
+        assert!(path.is_file());
+        let output = std::process::Command::new(&path)
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "1.2.3");
+    }
+
+    #[test]
+    fn install_npm_nonzero_exit_is_command_failed_with_the_code_surfaced() {
+        let _guard = path_guard();
+        let path_dir = tempdir().unwrap();
+        write_fake_npm_failure(path_dir.path(), 17);
+        let tmp = tempdir().unwrap();
+        let dist = npm_dist("@acme/broken-package");
+
+        let result = with_scratch_path(path_dir.path(), || {
+            install(
+                "broken-package",
+                &dist,
+                "1.0.0",
+                tmp.path(),
+                "broken-package",
+                &FakeFetcher::ok(Vec::new()),
+            )
+        });
+
+        let err = result.unwrap_err();
+        match &err {
+            AcquireError::CommandFailed { program, exit_code } => {
+                assert_eq!(program, "npm");
+                assert_eq!(*exit_code, Some(17));
+            }
+            other => panic!("expected CommandFailed, got {other:?}"),
+        }
+        // The exact reason text a degraded root would show (mod.rs's
+        // acquire_error_reason falls through to this Display for anything
+        // that isn't one of the brief's named cases).
+        assert_eq!(err.to_string(), "npm exited with Some(17)");
+        // No partial/version dir left behind after a failed install.
+        let id_dir = tmp.path().join("broken-package");
+        let remaining = std::fs::read_dir(&id_dir)
+            .map(|rd| rd.filter_map(|e| e.ok()).count())
+            .unwrap_or(0);
+        assert_eq!(remaining, 0, "no partial/version dirs should remain");
+    }
+
+    #[test]
+    fn install_npm_timeout_kills_the_process_well_before_it_would_finish() {
+        let _guard = path_guard();
+        let path_dir = tempdir().unwrap();
+        // Sleeps far longer than the test's own short timeout below; if the
+        // kill didn't actually happen, this test would hang for 30s+.
+        write_fake_npm_sleep(path_dir.path(), 30);
+        let tmp = tempdir().unwrap();
+
+        let (result, wall) = with_scratch_path(path_dir.path(), || {
+            let start = Instant::now();
+            let result = install_npm(
+                "@acme/slow-package",
+                "1.0.0",
+                tmp.path(),
+                Duration::from_millis(200),
+            );
+            (result, start.elapsed())
+        });
+
+        assert!(
+            matches!(result, Err(AcquireError::TimedOut(_))),
+            "expected TimedOut, got {result:?}"
+        );
+        // Generous margin: well under the 30s the fake npm would otherwise
+        // sleep for, proving the child was actually killed, not waited out.
+        assert!(
+            wall < Duration::from_secs(10),
+            "expected a prompt kill, took {wall:?}"
+        );
     }
 }

@@ -28,6 +28,26 @@ use crate::workspace::Workspace;
 /// killed and reported as "version unknown".
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Test-only support shared across every test module under `indexers/`
+/// (`mod.rs` and `acquire.rs` both have tests that read or mutate the
+/// process-wide `$PATH` env var). Lives here, one level up from either
+/// module's own `mod tests`, specifically so both share the *same* mutex
+/// -- two independent guards would each serialize their own module's
+/// tests but do nothing to stop them racing against each other.
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// `cargo test` runs tests concurrently by default, and `$PATH` is
+    /// genuinely global mutable state; every test that either mutates it
+    /// or resolves an indexer through the real `find_on_path` must take
+    /// this guard first. A poisoned lock (an earlier guarded test
+    /// panicked) must not cascade-fail every later test, so a poison is
+    /// recovered rather than propagated.
+    pub(crate) fn path_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// A SCIP indexer tamga knows about. Variants are added only as the
 /// families that drive them land, so the id space stays stable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -559,6 +579,7 @@ fn install_one(
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::path_guard;
     use super::*;
     use sha2::{Digest, Sha256};
     use std::fs;
@@ -598,20 +619,6 @@ mod tests {
                 "fake fetcher: not configured to succeed".into(),
             ))
         }
-    }
-
-    /// `find_on_path` reads the process-wide `$PATH`, and several tests
-    /// below temporarily overwrite it -- `cargo test` runs tests
-    /// concurrently by default, so without serializing, one test's
-    /// temporary PATH mutation can leak into another's PATH-dependent
-    /// resolution mid-test. Every test that either mutates `PATH` or
-    /// resolves an indexer through the real `find_on_path` takes this
-    /// guard first. A poisoned lock (an earlier guarded test panicked)
-    /// must not cascade-fail every later test, so a poison is recovered
-    /// rather than propagated.
-    fn path_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn write_executable(path: &Path, contents: &[u8]) {
