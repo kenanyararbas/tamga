@@ -519,13 +519,15 @@ fn missing_binary_fails_without_panicking_and_logs_the_spawn_error() {
 }
 
 // ---------------------------------------------------------------------
-// Extra: fake-indexer's --write-scip marker (not one of the 8 binding
-// tests, but M3 depends on this behavior, so it's worth a cheap direct
-// check rather than leaving it fully unexercised).
+// Extra: fake-indexer's --write-scip now emits a REAL SCIP index (M3
+// depends on this), with one document per --scip-doc. Worth a cheap
+// direct check rather than leaving it fully unexercised.
 // ---------------------------------------------------------------------
 
 #[test]
-fn write_scip_flag_writes_the_placeholder_marker_bytes() {
+fn write_scip_flag_writes_a_real_parseable_scip_index() {
+    use protobuf::Message;
+
     let dir = tempdir().unwrap();
     let cwd = dir.path().to_path_buf();
     let record_path = dir.path().join("records.jsonl");
@@ -533,7 +535,16 @@ fn write_scip_flag_writes_the_placeholder_marker_bytes() {
 
     let step = indexer_step(
         "writes-scip",
-        &["--write-scip", scip_path.to_str().unwrap(), "--exit", "0"],
+        &[
+            "--write-scip",
+            scip_path.to_str().unwrap(),
+            "--scip-doc",
+            "src/a.py",
+            "--scip-doc",
+            "src/b.py",
+            "--exit",
+            "0",
+        ],
         &cwd,
         &dir.path().join("s.log"),
         &record_path,
@@ -545,7 +556,14 @@ fn write_scip_flag_writes_the_placeholder_marker_bytes() {
 
     assert_eq!(result.status, StepStatus::Success);
     let bytes = std::fs::read(&scip_path).expect("--write-scip should have created the file");
-    assert_eq!(bytes, b"FAKE_SCIP_V1");
+    let index = scip::types::Index::parse_from_bytes(&bytes).expect("valid SCIP index");
+    let paths: Vec<&str> = index
+        .documents
+        .iter()
+        .map(|d| d.relative_path.as_str())
+        .collect();
+    assert_eq!(paths, vec!["src/a.py", "src/b.py"]);
+    assert_eq!(index.documents[0].occurrences.len(), 1);
 }
 
 // ---------------------------------------------------------------------
