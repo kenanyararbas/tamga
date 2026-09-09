@@ -46,7 +46,7 @@ fn stub(name: &str) -> i32 {
 fn run_doctor(args: DoctorArgs) -> i32 {
     let repo = args.path.unwrap_or_else(|| PathBuf::from("."));
     match load_config(Some(&repo)) {
-        Ok(_config) => {
+        Ok(_) => {
             tracing::debug!(repo = %repo.display(), "running doctor checks");
             println!("{}", tamga::doctor::run(Some(&repo)));
             0
@@ -56,16 +56,9 @@ fn run_doctor(args: DoctorArgs) -> i32 {
 }
 
 fn run_clean(args: CleanArgs) -> i32 {
-    if let Err(code) = load_config(None) {
-        return code;
-    }
-
-    let workspace = match Workspace::resolve() {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!("tamga clean: {e}");
-            return 1;
-        }
+    let workspace = match load_config(None) {
+        Ok((workspace, _config)) => workspace,
+        Err(code) => return code,
     };
 
     let mut targets = Vec::new();
@@ -104,15 +97,17 @@ fn run_clean(args: CleanArgs) -> i32 {
 /// Resolves tamga's home directory and loads the effective config for
 /// `repo` (if any repo-scoped context applies). On a config error, prints
 /// a clear message and returns the exit code the caller should propagate.
-fn load_config(repo: Option<&Path>) -> Result<TamgaConfig, i32> {
+/// Returns the workspace too since most callers need both.
+fn load_config(repo: Option<&Path>) -> Result<(Workspace, TamgaConfig), i32> {
     let workspace = Workspace::resolve().map_err(|e| {
         eprintln!("tamga: {e}");
         1
     })?;
-    tamga::config::load_effective_config(&workspace.home, repo, CliOverrides::default()).map_err(
-        |e| {
-            eprintln!("tamga: config error: {e}");
-            2
-        },
-    )
+    let config =
+        tamga::config::load_effective_config(&workspace.home, repo, CliOverrides::default())
+            .map_err(|e| {
+                eprintln!("tamga: config error: {e}");
+                2
+            })?;
+    Ok((workspace, config))
 }

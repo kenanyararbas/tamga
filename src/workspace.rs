@@ -232,7 +232,10 @@ mod tests {
         assert_ne!(a, b);
         // YYYYMMDD-HHMMSS-xxxx
         assert_eq!(a.len(), 8 + 1 + 6 + 1 + 4);
-        assert!(a < b || a.starts_with(&b[..15]) || b.starts_with(&a[..15]));
+        // Timestamps only move forward, so the id's timestamp prefix (and
+        // therefore its sort order relative to earlier ids) never goes
+        // backward across calls.
+        assert!(a[..15] <= b[..15]);
     }
 
     #[test]
