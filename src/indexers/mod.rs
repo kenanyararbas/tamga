@@ -55,6 +55,9 @@ pub enum IndexerId {
     ScipPython,
     ScipTypescript,
     ScipGo,
+    RustAnalyzer,
+    ScipRuby,
+    ScipPhp,
 }
 
 impl IndexerId {
@@ -64,6 +67,9 @@ impl IndexerId {
             IndexerId::ScipPython,
             IndexerId::ScipTypescript,
             IndexerId::ScipGo,
+            IndexerId::RustAnalyzer,
+            IndexerId::ScipRuby,
+            IndexerId::ScipPhp,
         ]
     }
 
@@ -74,6 +80,9 @@ impl IndexerId {
             IndexerId::ScipPython => "scip-python",
             IndexerId::ScipTypescript => "scip-typescript",
             IndexerId::ScipGo => "scip-go",
+            IndexerId::RustAnalyzer => "rust-analyzer",
+            IndexerId::ScipRuby => "scip-ruby",
+            IndexerId::ScipPhp => "scip-php",
         }
     }
 
@@ -143,6 +152,26 @@ pub fn find_on_path(bin: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Probes `rustup which rust-analyzer`: rustup answers with an absolute
+/// path when the active toolchain has an `rust-analyzer` component
+/// installed. Every failure mode (`rustup` itself absent, a non-zero exit
+/// because the toolchain has no such component, empty/garbage output, the
+/// printed path not actually existing) collapses to `None` -- this is a
+/// best-effort extra probe, never a hard requirement.
+fn rustup_which_rust_analyzer() -> Option<PathBuf> {
+    let output = Command::new("rustup")
+        .args(["which", "rust-analyzer"])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let path = PathBuf::from(text.trim());
+    is_executable_file(&path).then_some(path)
 }
 
 #[cfg(unix)]
@@ -244,6 +273,24 @@ fn resolve_pre_download(
     }
 
     if let Some(path) = find_on_path(id.binary_name()) {
+        let version = probe_version(&path);
+        return PreDownload::Resolved(ResolvedIndexer {
+            id,
+            path,
+            version,
+            resolved_from: ResolvedFrom::Path,
+            extra_args,
+        });
+    }
+
+    // rust-analyzer special case: it's a rustup-managed component as often
+    // as it's a bare `$PATH` binary. `rustup which rust-analyzer` answering
+    // is treated as a PATH-class hit (same `ResolvedFrom`), tried after a
+    // plain `$PATH` lookup misses and before falling through to tamga's own
+    // managed cache/download.
+    if id == IndexerId::RustAnalyzer
+        && let Some(path) = rustup_which_rust_analyzer()
+    {
         let version = probe_version(&path);
         return PreDownload::Resolved(ResolvedIndexer {
             id,
@@ -373,6 +420,7 @@ fn acquire_error_reason(id: IndexerId, e: &AcquireError) -> String {
     match e {
         AcquireError::ChecksumMismatch { asset } => format!("checksum mismatch for {asset}"),
         AcquireError::NpmMissing => format!("npm required to install {}", id.id_str()),
+        AcquireError::ComposerMissing => format!("composer required to install {}", id.id_str()),
         AcquireError::NoAssetForPlatform { triple } => format!(
             "no prebuilt {} binary for this platform ({triple})",
             id.id_str()
@@ -897,6 +945,121 @@ mod tests {
 
         assert_eq!(resolved.resolved_from, ResolvedFrom::Path);
         assert_eq!(resolved.path, on_path);
+    }
+
+    // --- rust-analyzer special case: rustup-which probe ----------------------
+
+    fn rust_analyzer_manifest(version: &str, triple: &str) -> Manifest {
+        let src = format!(
+            r#"
+            [rust-analyzer]
+            version = "{version}"
+            dist = "github-release"
+            repo = "rust-lang/rust-analyzer"
+            tag = "{version}"
+
+            [rust-analyzer.targets.{triple}]
+            asset = "rust-analyzer-{triple}.gz"
+            sha256 = "irrelevant-for-this-test"
+            "#
+        );
+        manifest::parse(&src).unwrap()
+    }
+
+    /// Writes a fake `rustup` onto `dir` whose `which rust-analyzer`
+    /// subcommand prints `answer`'s path and exits 0; any other invocation
+    /// (or no `--answer` case) is left to the caller via `ok`.
+    fn write_fake_rustup(dir: &Path, ok: bool, answer: &Path) {
+        let script = if ok {
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = which ] && [ \"$2\" = rust-analyzer ]; then echo {}; exit 0; fi\nexit 1\n",
+                answer.display()
+            )
+        } else {
+            "#!/bin/sh\nexit 1\n".to_string()
+        };
+        write_executable(&dir.join("rustup"), script.as_bytes());
+    }
+
+    #[test]
+    fn rustup_which_probe_is_treated_as_a_path_class_hit_when_rust_analyzer_is_not_on_path() {
+        let _guard = path_guard();
+        let (_ws_dir, workspace, _unused) = empty_ctx();
+        let triple = acquire::host_target_triple().unwrap();
+        let manifest = rust_analyzer_manifest("2026-09-07", &triple);
+
+        // The real rust-analyzer binary that rustup "knows about", NOT
+        // itself named `rust-analyzer` on a plain $PATH dir (it lives at a
+        // rustup-toolchain-managed path in reality; here it just needs to
+        // be some other executable file rustup's stdout points at).
+        let real_dir = tempdir().unwrap();
+        let real_bin = real_dir.path().join("real-rust-analyzer");
+        write_executable(&real_bin, b"#!/bin/sh\necho 1.2.3\n");
+
+        // A scratch PATH with only a fake `rustup` on it (no `rust-analyzer`
+        // binary directly on PATH), so the plain PATH lookup misses and the
+        // rustup-probe branch is what resolves this.
+        let path_dir = tempdir().unwrap();
+        write_fake_rustup(path_dir.path(), true, &real_bin);
+        let old_path = std::env::var_os("PATH");
+        unsafe { std::env::set_var("PATH", path_dir.path()) };
+
+        let cfg = TamgaConfig::default();
+        let fetcher = CountingFetcher::new();
+        let opts = ResolveOptions {
+            workspace: &workspace,
+            manifest: &manifest,
+            offline: false,
+            fetcher: &fetcher,
+        };
+        let resolved = resolve(IndexerId::RustAnalyzer, &cfg, &opts).unwrap();
+
+        match old_path {
+            Some(v) => unsafe { std::env::set_var("PATH", v) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+
+        assert_eq!(resolved.resolved_from, ResolvedFrom::Path);
+        assert_eq!(resolved.path, real_bin);
+        assert_eq!(
+            fetcher.calls(),
+            0,
+            "a rustup-probe hit must not fall through to a download"
+        );
+    }
+
+    #[test]
+    fn rustup_answering_no_such_component_falls_through_to_download() {
+        let _guard = path_guard();
+        let (_ws_dir, workspace, _unused) = empty_ctx();
+        let triple = acquire::host_target_triple().unwrap();
+        let manifest = rust_analyzer_manifest("2026-09-07", &triple);
+
+        // A scratch PATH with a fake `rustup` that always fails (as the
+        // real rustup does when the active toolchain has no rust-analyzer
+        // component) and nothing named `rust-analyzer` at all.
+        let path_dir = tempdir().unwrap();
+        write_fake_rustup(path_dir.path(), false, Path::new("/dev/null"));
+        let old_path = std::env::var_os("PATH");
+        unsafe { std::env::set_var("PATH", path_dir.path()) };
+
+        let cfg = TamgaConfig::default();
+        let fetcher = CountingFetcher::new();
+        let opts = ResolveOptions {
+            workspace: &workspace,
+            manifest: &manifest,
+            offline: true, // offline: prove it degrades rather than downloads
+            fetcher: &fetcher,
+        };
+        let err = resolve(IndexerId::RustAnalyzer, &cfg, &opts).unwrap_err();
+
+        match old_path {
+            Some(v) => unsafe { std::env::set_var("PATH", v) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+
+        assert_eq!(err, "indexer rust-analyzer unavailable (offline)");
+        assert_eq!(fetcher.calls(), 0);
     }
 
     // --- offline / auto_install=false ---------------------------------------

@@ -55,6 +55,8 @@ pub enum AcquireError {
     Unpack(String),
     #[error("npm is required to install this indexer but was not found on PATH")]
     NpmMissing,
+    #[error("composer is required to install this indexer but was not found on PATH")]
+    ComposerMissing,
     #[error("{program} exited with {exit_code:?}")]
     CommandFailed {
         program: String,
@@ -119,6 +121,7 @@ pub fn binary_path(dist: &DistKind, version_dir: &Path, bin_name: &str) -> PathB
     match dist {
         DistKind::GithubRelease { .. } => version_dir.join(bin_name),
         DistKind::Npm { .. } => version_dir.join("node_modules").join(".bin").join(bin_name),
+        DistKind::Composer { .. } => version_dir.join("vendor").join("bin").join(bin_name),
     }
 }
 
@@ -132,6 +135,26 @@ pub fn npm_install_argv(package: &str, version: &str, prefix: &Path) -> (String,
             "--prefix".to_string(),
             prefix.display().to_string(),
             format!("{package}@{version}"),
+        ],
+    )
+}
+
+/// Pure argv construction for the `composer require` invocation, split out
+/// so tests can assert on it directly without ever running real `composer`.
+/// `--working-dir` scopes the install to `dir` (tamga's own managed cache
+/// entry, never the target repo being indexed -- composer auto-creates a
+/// `composer.json` there on the fly per its own documented `require`
+/// behavior, since none exists yet). `--no-interaction` keeps this
+/// deterministic/non-prompting.
+pub fn composer_require_argv(package: &str, version: &str, dir: &Path) -> (String, Vec<String>) {
+    (
+        "composer".to_string(),
+        vec![
+            "require".to_string(),
+            "--working-dir".to_string(),
+            dir.display().to_string(),
+            "--no-interaction".to_string(),
+            format!("{package}:{version}"),
         ],
     )
 }
@@ -165,10 +188,19 @@ pub fn install(
     std::fs::create_dir_all(&staging_dir)?;
 
     let outcome = match dist {
-        DistKind::GithubRelease { repo, targets } => {
-            install_github_release(repo, targets, version, &staging_dir, bin_name, fetcher)
-        }
+        DistKind::GithubRelease { repo, tag, targets } => install_github_release(
+            repo,
+            tag.as_deref(),
+            targets,
+            version,
+            &staging_dir,
+            bin_name,
+            fetcher,
+        ),
         DistKind::Npm { package } => install_npm(package, version, &staging_dir, INSTALL_TIMEOUT),
+        DistKind::Composer { package } => {
+            install_composer(package, version, &staging_dir, INSTALL_TIMEOUT)
+        }
     };
 
     if let Err(e) = outcome {
@@ -210,6 +242,7 @@ fn staging_suffix() -> String {
 
 fn install_github_release(
     repo: &str,
+    tag: Option<&str>,
     targets: &BTreeMap<String, TargetAsset>,
     version: &str,
     staging_dir: &Path,
@@ -220,8 +253,16 @@ fn install_github_release(
     let target = targets
         .get(&triple)
         .ok_or(AcquireError::NoAssetForPlatform { triple })?;
+    let tag_owned;
+    let tag = match tag {
+        Some(t) => t,
+        None => {
+            tag_owned = format!("v{version}");
+            &tag_owned
+        }
+    };
     let url = format!(
-        "https://github.com/{repo}/releases/download/v{version}/{}",
+        "https://github.com/{repo}/releases/download/{tag}/{}",
         target.asset
     );
     let bytes = fetcher.fetch(&url)?;
@@ -257,6 +298,17 @@ fn unpack_asset(
         archive
             .extract(dest_dir)
             .map_err(|e| AcquireError::Unpack(e.to_string()))?;
+    } else if asset_name.ends_with(".gz") {
+        // A bare gzip-compressed binary, not a tarball (e.g.
+        // rust-lang/rust-analyzer's `rust-analyzer-<triple>.gz` release
+        // assets): gunzip directly to the target path.
+        use std::io::Read;
+        let mut decoder = flate2::read::GzDecoder::new(bytes);
+        let mut out = Vec::new();
+        decoder
+            .read_to_end(&mut out)
+            .map_err(|e| AcquireError::Unpack(e.to_string()))?;
+        std::fs::write(dest_dir.join(bin_name), out)?;
     } else {
         std::fs::write(dest_dir.join(bin_name), bytes)?;
     }
@@ -315,6 +367,34 @@ fn install_npm(
         return Err(AcquireError::NpmMissing);
     }
     let (program, args) = npm_install_argv(package, version, staging_dir);
+    let mut cmd = Command::new(&program);
+    cmd.args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let status = run_with_timeout(cmd, timeout)?;
+    if !status.success() {
+        return Err(AcquireError::CommandFailed {
+            program,
+            exit_code: status.code(),
+        });
+    }
+    Ok(())
+}
+
+/// `timeout` is a parameter for the same reason as [`install_npm`]'s: tests
+/// exercise the kill-on-timeout path against a fake, slow "composer"
+/// without waiting the real budget.
+fn install_composer(
+    package: &str,
+    version: &str,
+    staging_dir: &Path,
+    timeout: Duration,
+) -> Result<(), AcquireError> {
+    if super::find_on_path("composer").is_none() {
+        return Err(AcquireError::ComposerMissing);
+    }
+    let (program, args) = composer_require_argv(package, version, staging_dir);
     let mut cmd = Command::new(&program);
     cmd.args(&args)
         .stdin(Stdio::null())
@@ -483,7 +563,19 @@ exit 0
         );
         DistKind::GithubRelease {
             repo: "acme/fake-indexer".to_string(),
+            tag: None,
             targets,
+        }
+    }
+
+    fn github_dist_with_tag(asset: &str, sha256: &str, triple: &str, tag: &str) -> DistKind {
+        match github_dist(asset, sha256, triple) {
+            DistKind::GithubRelease { repo, targets, .. } => DistKind::GithubRelease {
+                repo,
+                tag: Some(tag.to_string()),
+                targets,
+            },
+            _ => unreachable!(),
         }
     }
 
@@ -590,6 +682,152 @@ exit 0
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(entries, vec!["1.0.0".to_string()]);
+    }
+
+    #[test]
+    fn install_github_release_unpacks_bare_gzip_not_a_tarball() {
+        // rust-lang/rust-analyzer's release assets are a single
+        // gzip-compressed binary, not a tar archive.
+        let tmp = tempdir().unwrap();
+        let raw = b"#!/bin/sh\necho hi\n".to_vec();
+        let mut buf = Vec::new();
+        {
+            let mut enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
+            use std::io::Write as _;
+            enc.write_all(&raw).unwrap();
+            enc.finish().unwrap();
+        }
+        let sha = sha256_hex(&buf);
+        let dist = github_dist("my-indexer.gz", &sha, &host_triple());
+        let fetcher = FakeFetcher::ok(buf);
+
+        let path = install(
+            "my-indexer",
+            &dist,
+            "1.0.0",
+            tmp.path(),
+            "my-indexer",
+            &fetcher,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), raw);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_ne!(mode & 0o111, 0, "gunzipped binary must be executable");
+        }
+    }
+
+    /// Records every URL it was asked to fetch, so the tag-vs-`v<version>`
+    /// URL-construction logic can be asserted directly.
+    struct UrlRecordingFetcher {
+        bytes: Vec<u8>,
+        urls: Mutex<Vec<String>>,
+    }
+
+    impl Fetcher for UrlRecordingFetcher {
+        fn fetch(&self, url: &str) -> Result<Vec<u8>, AcquireError> {
+            self.urls.lock().unwrap().push(url.to_string());
+            Ok(self.bytes.clone())
+        }
+    }
+
+    #[test]
+    fn github_release_with_no_tag_uses_v_prefixed_version_in_the_url() {
+        let tmp = tempdir().unwrap();
+        let bytes = b"raw".to_vec();
+        let sha = sha256_hex(&bytes);
+        let dist = github_dist("my-indexer", &sha, &host_triple());
+        let fetcher = UrlRecordingFetcher {
+            bytes,
+            urls: Mutex::new(Vec::new()),
+        };
+        install(
+            "my-indexer",
+            &dist,
+            "1.2.3",
+            tmp.path(),
+            "my-indexer",
+            &fetcher,
+        )
+        .unwrap();
+        assert_eq!(
+            fetcher.urls.lock().unwrap().as_slice(),
+            &[
+                "https://github.com/acme/fake-indexer/releases/download/v1.2.3/my-indexer"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn github_release_with_an_explicit_tag_uses_it_literally_in_the_url() {
+        // The whole reason `tag` exists: rust-analyzer/scip-ruby's real
+        // tags don't follow the `v<version>` convention.
+        let tmp = tempdir().unwrap();
+        let bytes = b"raw".to_vec();
+        // Wrap the raw bytes in gzip since the asset name ends in .gz.
+        let mut gz = Vec::new();
+        {
+            let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+            use std::io::Write as _;
+            enc.write_all(&bytes).unwrap();
+            enc.finish().unwrap();
+        }
+        let sha = sha256_hex(&gz);
+        let dist = github_dist_with_tag("my-indexer.gz", &sha, &host_triple(), "2026-09-07");
+        let fetcher = UrlRecordingFetcher {
+            bytes: gz,
+            urls: Mutex::new(Vec::new()),
+        };
+        install(
+            "my-indexer",
+            &dist,
+            "1.2.3",
+            tmp.path(),
+            "my-indexer",
+            &fetcher,
+        )
+        .unwrap();
+        assert_eq!(
+            fetcher.urls.lock().unwrap().as_slice(),
+            &[
+                "https://github.com/acme/fake-indexer/releases/download/2026-09-07/my-indexer.gz"
+                    .to_string()
+            ]
+        );
+    }
+
+    // --- composer argv (pure, no real composer ever runs) -----------------
+
+    #[test]
+    fn composer_require_argv_builds_expected_command() {
+        let dir = PathBuf::from("/tools/scip-php/0.0.2");
+        let (program, args) = composer_require_argv("davidrjenni/scip-php", "0.0.2", &dir);
+        assert_eq!(program, "composer");
+        assert_eq!(
+            args,
+            vec![
+                "require",
+                "--working-dir",
+                "/tools/scip-php/0.0.2",
+                "--no-interaction",
+                "davidrjenni/scip-php:0.0.2",
+            ]
+        );
+    }
+
+    #[test]
+    fn binary_path_for_composer_is_under_vendor_bin() {
+        let dist = DistKind::Composer {
+            package: "davidrjenni/scip-php".to_string(),
+        };
+        let dir = PathBuf::from("/tools/scip-php/0.0.2");
+        assert_eq!(
+            binary_path(&dist, &dir, "scip-php"),
+            PathBuf::from("/tools/scip-php/0.0.2/vendor/bin/scip-php")
+        );
     }
 
     #[test]
@@ -903,5 +1141,131 @@ exit 0
             wall < Duration::from_secs(10),
             "expected a prompt kill, took {wall:?}"
         );
+    }
+
+    // --- composer execution path (fake composer on a scratch PATH, never the
+    //     real composer) -------------------------------------------------
+
+    fn composer_dist(package: &str) -> DistKind {
+        DistKind::Composer {
+            package: package.to_string(),
+        }
+    }
+
+    /// Writes a fake `composer` onto `dir` that, on success, creates the
+    /// `vendor/bin/<bin_name>` layout a real `composer require
+    /// --working-dir <dir>` would -- parsed out of its own `--working-dir`
+    /// argument, exactly like `composer_require_argv` constructs it.
+    fn write_fake_composer_success(dir: &Path, bin_name: &str) {
+        let script = format!(
+            "#!/bin/sh
+wd=\"\"
+while [ $# -gt 0 ]; do
+case \"$1\" in
+--working-dir) wd=\"$2\"; shift 2 ;;
+*) shift ;;
+esac
+done
+mkdir -p \"$wd/vendor/bin\"
+printf '#!/bin/sh\\necho 1.2.3\\n' > \"$wd/vendor/bin/{bin_name}\"
+chmod +x \"$wd/vendor/bin/{bin_name}\"
+exit 0
+"
+        );
+        write_executable(&dir.join("composer"), script.as_bytes());
+    }
+
+    fn write_fake_composer_failure(dir: &Path, exit_code: i32) {
+        let script = format!("#!/bin/sh\nexit {exit_code}\n");
+        write_executable(&dir.join("composer"), script.as_bytes());
+    }
+
+    #[test]
+    fn install_composer_success_resolves_the_installed_binary() {
+        let _guard = path_guard();
+        let path_dir = tempdir().unwrap();
+        write_fake_composer_success(path_dir.path(), "scip-php");
+        let tmp = tempdir().unwrap();
+        let dist = composer_dist("davidrjenni/scip-php");
+
+        let result = with_scratch_path(path_dir.path(), || {
+            install(
+                "scip-php",
+                &dist,
+                "0.0.2",
+                tmp.path(),
+                "scip-php",
+                &FakeFetcher::ok(Vec::new()),
+            )
+        });
+
+        let path = result.expect("fake composer install should succeed");
+        assert_eq!(
+            path,
+            tmp.path()
+                .join("scip-php")
+                .join("0.0.2")
+                .join("vendor")
+                .join("bin")
+                .join("scip-php")
+        );
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn install_composer_nonzero_exit_is_command_failed() {
+        let _guard = path_guard();
+        let path_dir = tempdir().unwrap();
+        write_fake_composer_failure(path_dir.path(), 3);
+        let tmp = tempdir().unwrap();
+        let dist = composer_dist("davidrjenni/scip-php");
+
+        let result = with_scratch_path(path_dir.path(), || {
+            install(
+                "scip-php",
+                &dist,
+                "0.0.2",
+                tmp.path(),
+                "scip-php",
+                &FakeFetcher::ok(Vec::new()),
+            )
+        });
+
+        let err = result.unwrap_err();
+        match &err {
+            AcquireError::CommandFailed { program, exit_code } => {
+                assert_eq!(program, "composer");
+                assert_eq!(*exit_code, Some(3));
+            }
+            other => panic!("expected CommandFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn install_composer_missing_from_path_is_composer_missing() {
+        let _guard = path_guard();
+        let empty_dir = tempdir().unwrap();
+        let tmp = tempdir().unwrap();
+        let dist = composer_dist("davidrjenni/scip-php");
+
+        // A scratch PATH with nothing on it at all -- not even coreutils --
+        // since this path never spawns anything (composer isn't found
+        // before any command is built).
+        let old = std::env::var_os("PATH");
+        unsafe { std::env::set_var("PATH", empty_dir.path()) };
+        let result = install(
+            "scip-php",
+            &dist,
+            "0.0.2",
+            tmp.path(),
+            "scip-php",
+            &FakeFetcher::ok(Vec::new()),
+        );
+        match old {
+            Some(v) => unsafe { std::env::set_var("PATH", v) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+
+        assert!(matches!(result, Err(AcquireError::ComposerMissing)));
     }
 }

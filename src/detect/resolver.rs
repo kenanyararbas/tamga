@@ -57,7 +57,9 @@ pub fn resolve(
             }
             match best {
                 Some(i) => {
-                    let reason = subsume_reason(&accepted[i].candidate, &c);
+                    let reason = family
+                        .subsume_reason(&accepted[i].candidate, &c)
+                        .unwrap_or_else(|| generic_subsume_reason(&accepted[i].candidate, &c));
                     accepted[i].subsumed.push((c.dir.clone(), reason));
                 }
                 None => {
@@ -107,8 +109,9 @@ fn is_strict_ancestor(anc: &Path, desc: &Path) -> bool {
 }
 
 /// Human-readable reason a child was swallowed, derived generically from
-/// the ancestor/child strengths so no family needs to supply prose.
-fn subsume_reason(ancestor: &RootCandidate, child: &RootCandidate) -> String {
+/// the ancestor/child strengths -- the fallback when a family's
+/// `subsume_reason` has nothing more specific to say.
+fn generic_subsume_reason(ancestor: &RootCandidate, child: &RootCandidate) -> String {
     let anc = ancestor_label(&ancestor.dir);
     if ancestor.strength == RootStrength::Workspace {
         format!("workspace member of {anc}")

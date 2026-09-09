@@ -68,6 +68,11 @@ pub struct RootReport {
     /// Non-fatal observations (e.g. a best-effort install that failed, or a
     /// salvaged index).
     pub notes: Vec<String>,
+    /// Permanent writes this root's processing made into the repo tree
+    /// itself (as opposed to tamga's own workspace/cache), e.g. PHP's
+    /// `composer install` populating `vendor/`. Empty for families that
+    /// never write into the repo.
+    pub repo_writes: Vec<String>,
     /// Index statistics, when an index was produced and parsed.
     pub stats: Option<RootStats>,
     /// Documents whose path couldn't be mapped to the repo during rebasing
@@ -89,6 +94,7 @@ impl RootReport {
             env_cache: None,
             steps: Vec::new(),
             notes: Vec::new(),
+            repo_writes: Vec::new(),
             stats: None,
             unmapped_documents: 0,
         }

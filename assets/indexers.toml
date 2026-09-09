@@ -48,3 +48,70 @@ package = "@sourcegraph/scip-typescript"
 version = "0.6.6"
 dist = "npm"
 package = "@sourcegraph/scip-python"
+
+# M5 additions, verified 2026-09-09 (see task-6-report.md for the full
+# research trail):
+#
+# - rust-analyzer: rust-lang/rust-analyzer publishes date-stamped release
+#   tags (e.g. `2026-09-07`), not `v<version>` -- hence the explicit `tag`
+#   below (see DistKind::GithubRelease's `tag` field). Release assets are a
+#   bare gzip-compressed binary per target (`.gz`, not `.tar.gz`), verified
+#   by independently downloading and re-hashing each asset locally in
+#   addition to cross-checking GitHub's own reported asset digest. Every
+#   listed target was also live-tested end to end (gunzip, chmod, `scip
+#   <dir> --output <file>` against a real Cargo fixture).
+# - scip-ruby: the real project is `sourcegraph/scip-ruby` -- the brief's
+#   guess of `sorbet/scip-ruby` does not exist (404). Release tags are
+#   `scip-ruby-v<version>`, not `v<version>`, hence the explicit `tag`.
+#   Only two targets ship a prebuilt binary at all (bare executable, no
+#   archive): macOS arm64 and Linux x86_64. There is no
+#   aarch64-unknown-linux-gnu asset (the gap sits on Linux arm64 here,
+#   unlike scip-go's Intel-mac gap) -- that target resolves to the existing
+#   "no prebuilt binary for this platform" error. The macOS arm64 binary
+#   was downloaded, checksum-verified locally, and live-tested
+#   (`--index-file <file> --gem-metadata <name>@<version> <dir>`) against a
+#   tiny Ruby fixture with a gemspec.
+# - scip-php: the brief's guessed package name `davidrjenni/scip-php` is
+#   correct (verified on Packagist and GitHub). It has no tagged binary
+#   releases at all -- it's a composer dev-dependency, installed via
+#   `composer require`, landing at `vendor/bin/scip-php` (see the new
+#   `dist = "composer"` kind). No separate checksum is tracked, same
+#   rationale as the npm-dist entries: composer's own package-integrity
+#   check is the trust boundary.
+
+[rust-analyzer]
+version = "2026-09-07"
+dist = "github-release"
+repo = "rust-lang/rust-analyzer"
+tag = "2026-09-07"
+
+[rust-analyzer.targets.aarch64-apple-darwin]
+asset = "rust-analyzer-aarch64-apple-darwin.gz"
+sha256 = "16e9b2af9db7c0ce015ffe88f85db27669b05c84887a59c737d697d2c5f8d349"
+
+[rust-analyzer.targets.x86_64-unknown-linux-gnu]
+asset = "rust-analyzer-x86_64-unknown-linux-gnu.gz"
+sha256 = "a3500183aa08bf740c0da6e030ad262d4cfa1c19e7ce195ab5f772bdf9ddfb12"
+
+[rust-analyzer.targets.aarch64-unknown-linux-gnu]
+asset = "rust-analyzer-aarch64-unknown-linux-gnu.gz"
+sha256 = "484de96ea9e5daf9e6361b6fa91be9521a7e6c652111af54a7ead80f900b1e55"
+
+[scip-ruby]
+version = "0.4.8"
+dist = "github-release"
+repo = "sourcegraph/scip-ruby"
+tag = "scip-ruby-v0.4.8"
+
+[scip-ruby.targets.aarch64-apple-darwin]
+asset = "scip-ruby-arm64-darwin"
+sha256 = "21eae26b54402b04214ba5e6f6014c9f6b0fa394352825f33eb6314666dabd79"
+
+[scip-ruby.targets.x86_64-unknown-linux-gnu]
+asset = "scip-ruby-x86_64-linux"
+sha256 = "125982c27b59f8f35e6eb2904718789a4bdf28b0637baad9532977769b6058a7"
+
+[scip-php]
+version = "0.0.2"
+dist = "composer"
+package = "davidrjenni/scip-php"

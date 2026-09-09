@@ -25,7 +25,10 @@ use crate::prepare::PrepareCtx;
 
 pub mod go;
 pub mod jsts;
+pub mod php;
 pub mod python;
+pub mod ruby;
+pub mod rustlang;
 
 /// Stable identity of a family. All nine planned variants are listed so
 /// the serialized id space never shifts as later milestones land; only the
@@ -88,6 +91,12 @@ pub enum MarkerKind {
     // Go
     GoWork,
     GoMod,
+    // Rust
+    CargoToml,
+    // Ruby
+    Gemfile,
+    // PHP
+    ComposerJson,
 }
 
 /// A marker filename and the kind it denotes. Families expose these as a
@@ -129,6 +138,21 @@ pub enum FamilyMeta {
         package_manager: PackageManager,
     },
     Go,
+    Rust {
+        /// `[workspace] exclude` globs, parsed alongside `member_patterns`
+        /// (`[workspace] members`). Kept here rather than as a second field
+        /// on `RootCandidate` since it's Rust-specific and `subsumes` can
+        /// reach it through `ancestor.meta`. Empty for a non-workspace
+        /// Cargo.toml.
+        exclude_patterns: Vec<String>,
+    },
+    Ruby {
+        /// Whether this dir's candidate is backed by a `Gemfile` (as
+        /// opposed to a bare `*.gemspec` with no `Gemfile`). Only a
+        /// `Gemfile`-bearing root subsumes nested Ruby candidates.
+        has_gemfile: bool,
+    },
+    Php,
 }
 
 /// Detection behaviour for one family. M1 keeps the trait detection-only:
@@ -152,6 +176,16 @@ pub trait Family: Sync + Send {
         true
     }
 
+    /// Custom human reason text for why `ancestor` swallowed `child`,
+    /// overriding the resolver's generic "nested `<strength>` root under
+    /// `<ancestor>`" wording when family-specific context helps (e.g.
+    /// Ruby's Rails-engines-live-inside-the-app rationale). Default `None`
+    /// keeps the generic wording.
+    fn subsume_reason(&self, ancestor: &RootCandidate, child: &RootCandidate) -> Option<String> {
+        let _ = (ancestor, child);
+        None
+    }
+
     /// The SCIP indexer that produces this family's indexes (ruling R1:
     /// the trait grows an indexing surface now that M3 has landed).
     fn indexer(&self) -> IndexerId;
@@ -165,6 +199,25 @@ pub trait Family: Sync + Send {
     /// The step that runs the indexer and writes the root's `.scip` to
     /// `out`.
     fn index_step(&self, root: &ResolvedRoot, out: &Path, ctx: &PrepareCtx) -> ExecStep;
+
+    /// Slots this family's root consumes from the pool's `jobs` budget
+    /// (see [`crate::exec::RootTask::weight`]). `1` for every M1-M4 family;
+    /// Rust overrides this to `2` since rust-analyzer's `scip` subcommand
+    /// drives a full `cargo check` under the hood.
+    fn weight(&self) -> u32 {
+        1
+    }
+
+    /// A hard prerequisite check run once per root, before any prepare/
+    /// index steps are built, in addition to (not instead of) indexer
+    /// resolution. Returns the exact degrade reason when the root cannot
+    /// proceed at all (e.g. Rust's `cargo` not being on `PATH`, since
+    /// rust-analyzer's `scip` subcommand shells out to it). Default: no
+    /// extra prerequisite (every M1-M4 family had none).
+    fn check_prereqs(&self, root: &ResolvedRoot, ctx: &PrepareCtx) -> Result<(), String> {
+        let _ = (root, ctx);
+        Ok(())
+    }
 }
 
 /// The families wired into the engine for this milestone.
@@ -173,6 +226,9 @@ pub fn registry() -> Vec<Box<dyn Family>> {
         Box::new(python::Python),
         Box::new(jsts::JsTs),
         Box::new(go::Go),
+        Box::new(rustlang::Rust),
+        Box::new(ruby::Ruby),
+        Box::new(php::Php),
     ]
 }
 

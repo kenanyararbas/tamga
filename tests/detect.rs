@@ -486,6 +486,207 @@ fn case14_broken_package_json_degrades_with_parse_error() {
     );
 }
 
+// ---- M5: Rust, Ruby, PHP families -------------------------------------
+
+// M5 case 1: Cargo workspace, 2 member globs + 1 excluded crate + 1
+// outside-glob crate -> 1 workspace root subsuming 2, exclude + outsider
+// independent.
+#[test]
+fn m5_case1_cargo_workspace_members_exclude_and_outsider() {
+    let repo = tempdir().unwrap();
+    write(
+        repo.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"crates/excluded\"]\n",
+    );
+    write(
+        repo.path(),
+        "crates/a/Cargo.toml",
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        repo.path(),
+        "crates/b/Cargo.toml",
+        "[package]\nname = \"b\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        repo.path(),
+        "crates/excluded/Cargo.toml",
+        "[package]\nname = \"excluded\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        repo.path(),
+        "outside/Cargo.toml",
+        "[package]\nname = \"outside\"\nversion = \"0.1.0\"\n",
+    );
+
+    let report = run(repo.path());
+    assert_eq!(
+        ids(&report),
+        vec!["root+rust", "crates-excluded+rust", "outside+rust"]
+    );
+
+    let root = find(&report, "").unwrap();
+    assert_eq!(root.candidate.family, FamilyId::Rust);
+    assert_eq!(root.candidate.strength, RootStrength::Workspace);
+    assert_eq!(
+        subsumed_dirs(root),
+        vec!["crates/a".to_string(), "crates/b".to_string()]
+    );
+
+    assert!(
+        find(&report, "crates/excluded")
+            .unwrap()
+            .subsumed
+            .is_empty()
+    );
+    assert!(find(&report, "outside").unwrap().subsumed.is_empty());
+}
+
+// M5 case 2: virtual manifest ([workspace], no [package]) -> Workspace root.
+#[test]
+fn m5_case2_virtual_manifest_is_a_workspace_root() {
+    let repo = tempdir().unwrap();
+    write(
+        repo.path(),
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"crates/a\"]\n",
+    );
+    write(
+        repo.path(),
+        "crates/a/Cargo.toml",
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+    );
+
+    let report = run(repo.path());
+    let root = find(&report, "").unwrap();
+    assert_eq!(root.candidate.strength, RootStrength::Workspace);
+    assert_eq!(subsumed_dirs(root), vec!["crates/a".to_string()]);
+}
+
+// M5 case 3: nested Cargo.toml under a non-workspace root -> 2 roots.
+#[test]
+fn m5_case3_nested_cargo_toml_under_plain_package_is_independent() {
+    let repo = tempdir().unwrap();
+    write(
+        repo.path(),
+        "svc/Cargo.toml",
+        "[package]\nname = \"svc\"\nversion = \"0.1.0\"\n",
+    );
+    write(
+        repo.path(),
+        "svc/nested/Cargo.toml",
+        "[package]\nname = \"nested\"\nversion = \"0.1.0\"\n",
+    );
+
+    let report = run(repo.path());
+    assert_eq!(ids(&report), vec!["svc+rust", "svc-nested+rust"]);
+    assert!(find(&report, "svc").unwrap().subsumed.is_empty());
+    assert!(find(&report, "svc/nested").unwrap().subsumed.is_empty());
+}
+
+// M5 case 4: shallowest Gemfile subsumes nested Gemfile + gemspec; orphan
+// gemspec is its own root; sibling Gemfiles stay independent.
+#[test]
+fn m5_case4_shallowest_gemfile_subsumes_nested_gemfile_and_gemspec() {
+    let repo = tempdir().unwrap();
+    write(
+        repo.path(),
+        "app/Gemfile",
+        "source 'https://rubygems.org'\n",
+    );
+    write(
+        repo.path(),
+        "app/engines/billing/Gemfile",
+        "source 'https://rubygems.org'\n",
+    );
+    write(
+        repo.path(),
+        "app/libs/local_gem/local.gemspec",
+        "Gem::Specification.new { |s| s.name = 'local' }\n",
+    );
+    write(
+        repo.path(),
+        "standalone/mygem.gemspec",
+        "Gem::Specification.new { |s| s.name = 'mygem' }\n",
+    );
+    write(
+        repo.path(),
+        "other/Gemfile",
+        "source 'https://rubygems.org'\n",
+    );
+
+    let report = run(repo.path());
+    assert_eq!(
+        ids(&report),
+        vec!["app+ruby", "other+ruby", "standalone+ruby"]
+    );
+
+    let app = find(&report, "app").unwrap();
+    assert_eq!(app.candidate.strength, RootStrength::Project);
+    assert_eq!(
+        subsumed_dirs(app),
+        vec![
+            "app/engines/billing".to_string(),
+            "app/libs/local_gem".to_string()
+        ]
+    );
+    for (_, reason) in &app.subsumed {
+        assert!(
+            reason.contains("Gemfile") && reason.contains("Rails engines"),
+            "reason should explain the Gemfile/Rails-engine rationale: {reason}"
+        );
+    }
+
+    let standalone = find(&report, "standalone").unwrap();
+    assert!(standalone.subsumed.is_empty());
+    let other = find(&report, "other").unwrap();
+    assert!(other.subsumed.is_empty());
+}
+
+// M5 case 5: nested composer.json subsumed; vendor/composer.json ignored
+// entirely (vendor/ is in the walker's built-in ignore overlay).
+#[test]
+fn m5_case5_nested_composer_json_subsumed_vendor_ignored() {
+    let repo = tempdir().unwrap();
+    write(repo.path(), "composer.json", "{\"name\": \"acme/app\"}\n");
+    write(
+        repo.path(),
+        "packages/foo/composer.json",
+        "{\"name\": \"acme/foo\"}\n",
+    );
+    write(
+        repo.path(),
+        "vendor/somelib/composer.json",
+        "{\"name\": \"vendor/somelib\"}\n",
+    );
+
+    let report = run(repo.path());
+    assert_eq!(ids(&report), vec!["root+php"]);
+    let root = find(&report, "").unwrap();
+    assert_eq!(root.candidate.strength, RootStrength::Project);
+    assert_eq!(subsumed_dirs(root), vec!["packages/foo".to_string()]);
+}
+
+// M5 case 6: broken Cargo.toml -> parse-error evidence, no crash.
+#[test]
+fn m5_case6_broken_cargo_toml_degrades_with_parse_error() {
+    let repo = tempdir().unwrap();
+    write(repo.path(), "Cargo.toml", "this is not [ valid toml");
+
+    let report = run(repo.path());
+    assert_eq!(ids(&report), vec!["root+rust"]);
+    let root = find(&report, "").unwrap();
+    assert_eq!(root.candidate.strength, RootStrength::Project);
+    assert!(
+        root.candidate
+            .evidence
+            .iter()
+            .any(|e| e.note.starts_with("parse-error:")),
+        "broken Cargo.toml should leave a parse-error note"
+    );
+}
+
 // ---- snapshots -------------------------------------------------------
 
 #[test]

@@ -37,6 +37,9 @@ struct RunnablePlan {
     /// log paths and `stop_on_fail` flags are available when building the
     /// report from results.
     steps: Vec<ExecStep>,
+    /// Slots this root's task consumes from the pool's `jobs` budget
+    /// (`Family::weight`).
+    weight: u32,
 }
 
 /// Entry point for `tamga index`. Returns the process exit code.
@@ -180,6 +183,16 @@ pub fn run_index(args: &IndexArgs) -> i32 {
             env_cache_hit,
         };
 
+        if let Err(reason) = family.check_prereqs(&root, &ctx) {
+            pre_reports.push(degraded_root(
+                &root,
+                Some(indexer_info(&resolved)),
+                Some(env_cache_label(env_cache_hit)),
+                reason,
+            ));
+            continue;
+        }
+
         let mut steps = family.prepare(&root, &ctx);
         let mut index_step = family.index_step(&root, &out_path, &ctx);
         // Append any config-provided extra indexer args to the index step.
@@ -195,6 +208,7 @@ pub fn run_index(args: &IndexArgs) -> i32 {
             env_dir,
             out_path,
             steps,
+            weight: family.weight(),
         });
     }
 
@@ -203,7 +217,7 @@ pub fn run_index(args: &IndexArgs) -> i32 {
         .iter()
         .map(|p| RootTask {
             id: p.root.id.clone(),
-            weight: 1,
+            weight: p.weight,
             steps: p.steps.clone(),
         })
         .collect();
@@ -280,6 +294,20 @@ fn build_root_report(
     let mut report = base_root_report(plan);
     report.steps = step_reports(plan, &result.steps);
 
+    // PHP's `composer install` prep step writes `vendor/` directly into the
+    // repo -- the plan-sanctioned permanent repo write for this family.
+    // Surface it whenever the step actually ran (regardless of outcome: even
+    // a failed install can leave partial writes under vendor/).
+    if result
+        .steps
+        .iter()
+        .any(|(id, _)| id == families::php::COMPOSER_INSTALL_STEP_ID)
+    {
+        report
+            .repo_writes
+            .push("composer install created/updated vendor/".to_string());
+    }
+
     // Cancellation wins outright.
     if result.cancelled_before_start
         || result
@@ -351,6 +379,17 @@ fn build_root_report(
             let rebase_stats = rebase::rebase_index(&mut index, &plan.root.candidate.dir, repo_abs);
             // Per-root artifact keeps its rebased form.
             let _ = merge::write_index(&plan.out_path, &index);
+
+            // PHP's index step wraps scip-php (which always writes
+            // `./index.scip` into its cwd, i.e. the repo) and moves that
+            // file out to `out_path` -- a successfully-read index here means
+            // the move already happened, so the repo tree is clean again by
+            // the time this note is read.
+            if plan.root.candidate.family == FamilyId::Php {
+                report
+                    .notes
+                    .push("moved index.scip out of repo (temporary write)".to_string());
+            }
 
             let (documents, occurrences) = merge::index_stats(&index);
             report.status = RootStatus::Indexed;

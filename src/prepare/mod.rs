@@ -135,9 +135,47 @@ pub fn manifest_files(family: FamilyId, repo: &Path, root_dir: &Path) -> Vec<Pat
             .iter()
             .filter_map(|n| present(n))
             .collect(),
+        // Rust: Cargo.toml, plus Cargo.lock when present.
+        FamilyId::Rust => ["Cargo.toml", "Cargo.lock"]
+            .iter()
+            .filter_map(|n| present(n))
+            .collect(),
+        // Ruby: Gemfile, Gemfile.lock, and any *.gemspec files directly at
+        // the root dir (not recursive -- only the root's own gemspecs are
+        // part of its env identity).
+        FamilyId::Ruby => {
+            let mut out = Vec::new();
+            for name in ["Gemfile", "Gemfile.lock"] {
+                if let Some(p) = present(name) {
+                    out.push(p);
+                }
+            }
+            out.extend(root_gemspecs(repo, root_dir));
+            out
+        }
+        // PHP: composer.json, plus composer.lock when present.
+        FamilyId::Php => ["composer.json", "composer.lock"]
+            .iter()
+            .filter_map(|n| present(n))
+            .collect(),
         // Families without a build env yet: no manifest.
         _ => Vec::new(),
     }
+}
+
+/// `*.gemspec` files directly inside `repo/root_dir` (non-recursive),
+/// sorted by file name for a stable manifest hash.
+fn root_gemspecs(repo: &Path, root_dir: &Path) -> Vec<PathBuf> {
+    let dir = join_root(repo, root_dir, "");
+    let mut out: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("gemspec"))
+        .collect();
+    out.sort();
+    out
 }
 
 /// 12-hex-char digest over the ordered manifest files' contents. Each
@@ -215,6 +253,65 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["pyproject.toml", "requirements.txt"]);
+    }
+
+    #[test]
+    fn manifest_files_rust_selects_cargo_toml_and_lock_when_present() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("Cargo.toml"), b"[package]\n").unwrap();
+        let files = manifest_files(FamilyId::Rust, dir.path(), Path::new(""));
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["Cargo.toml"]);
+
+        fs::write(dir.path().join("Cargo.lock"), b"").unwrap();
+        let files = manifest_files(FamilyId::Rust, dir.path(), Path::new(""));
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["Cargo.toml", "Cargo.lock"]);
+    }
+
+    #[test]
+    fn manifest_files_ruby_includes_gemfile_lock_and_root_gemspecs() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("Gemfile"), b"").unwrap();
+        fs::write(dir.path().join("Gemfile.lock"), b"").unwrap();
+        fs::write(dir.path().join("app.gemspec"), b"").unwrap();
+        // A gemspec in a subdir must NOT be picked up (root dir only).
+        fs::create_dir_all(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/nested.gemspec"), b"").unwrap();
+
+        let files = manifest_files(FamilyId::Ruby, dir.path(), Path::new(""));
+        let mut names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "Gemfile".to_string(),
+                "Gemfile.lock".to_string(),
+                "app.gemspec".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn manifest_files_php_selects_composer_json_and_lock() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("composer.json"), b"{}").unwrap();
+        fs::write(dir.path().join("composer.lock"), b"{}").unwrap();
+        let files = manifest_files(FamilyId::Php, dir.path(), Path::new(""));
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["composer.json", "composer.lock"]);
     }
 
     #[test]

@@ -48,6 +48,10 @@ const TOOLS: &[ToolCheck] = &[
         version_args: &["--version"],
     },
     ToolCheck {
+        name: "rustup",
+        version_args: &["--version"],
+    },
+    ToolCheck {
         name: "java",
         version_args: &["-version"],
     },
