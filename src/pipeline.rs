@@ -393,7 +393,17 @@ fn build_root_report(
     // actually ran AND the file exists now but didn't before: comparing
     // against the pre-run snapshot (rather than just "does it exist now")
     // avoids crediting tamga with a tsconfig.json the repo already had.
-    if !plan.jsts_tsconfig_preexisted && result.steps.iter().any(|(id, _)| id == INDEX_STEP_ID) {
+    // MUST also check the family explicitly here, not just the
+    // `preexisted` flag: that flag is `false` both for "JsTs root with no
+    // preexisting tsconfig.json" (the case this note is for) AND for
+    // "any non-JsTs root" (since its family-gated computation short-
+    // circuits to `false`) -- collapsing those under `!preexisted` alone
+    // would falsely credit e.g. a Go root that merely shares a directory
+    // with an unrelated, already-there tsconfig.json.
+    if plan.root.candidate.family == FamilyId::JsTs
+        && !plan.jsts_tsconfig_preexisted
+        && result.steps.iter().any(|(id, _)| id == INDEX_STEP_ID)
+    {
         let tsconfig =
             families::abs_root_dir(repo_abs, &plan.root.candidate.dir).join("tsconfig.json");
         if tsconfig.is_file() {

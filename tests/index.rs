@@ -1363,6 +1363,87 @@ fn m8_jsts_preexisting_tsconfig_is_not_disclosed_as_a_repo_write() {
     );
 }
 
+// Regression for a bug this wave introduced: the tsconfig.json disclosure
+// check must be gated on the root's family, not just on "did the
+// pre-existed flag come back false". That flag is false both for a
+// genuinely-new JsTs tsconfig.json AND for any non-JsTs root (whose
+// family-gated computation always short-circuits to false), so without an
+// explicit family check at the disclosure site, a non-JsTs root that
+// merely shares a directory with an already-there tsconfig.json would be
+// falsely credited with "scip-typescript created tsconfig.json in the
+// repo" even though scip-typescript never ran and the file was never
+// touched.
+#[test]
+fn m8_non_jsts_root_with_preexisting_tsconfig_is_not_falsely_credited() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let out = tempdir().unwrap();
+    fs::write(
+        repo.path().join("go.mod"),
+        "module example.com/x\n\ngo 1.18\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join("main.go"),
+        "package main\n\nfunc main() {}\n",
+    )
+    .unwrap();
+    // Co-located, pre-existing, and unrelated to Go -- e.g. left over from
+    // some frontend tooling config at the repo root.
+    fs::write(repo.path().join("tsconfig.json"), "{}\n").unwrap();
+
+    let fake = fake_indexer();
+    let fake = fake.to_str().unwrap();
+    fs::write(
+        repo.path().join(".tamga.toml"),
+        format!("[indexers.scip-go]\npath = \"{fake}\"\nargs = [\"--scip-doc\", \"main.go\"]\n"),
+    )
+    .unwrap();
+
+    // A bare tsconfig.json with no sibling package.json is itself valid
+    // JS/TS evidence (it mints its own Project root -- see families/jsts.rs)
+    // and would otherwise land a second, unrelated root at the same dir.
+    // `--only go` isolates the Go root under test while leaving the
+    // co-located tsconfig.json file on disk exactly where the bug's check
+    // inspects it.
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .args(["index"])
+        .arg(repo.path())
+        .args(["--no-install", "--only", "go", "--output"])
+        .arg(out.path())
+        .assert()
+        .code(0);
+
+    let report = read_report(out.path());
+    assert_eq!(
+        report["roots"].as_array().unwrap().len(),
+        1,
+        "only the Go root should have been planned: {report:#}"
+    );
+    let root = root_by_dir(&report, ".");
+    assert_eq!(root["family"], "go", "root: {root:#}");
+    let writes: Vec<&str> = root["repo_writes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        !writes.iter().any(|w| w.contains("tsconfig.json")),
+        "a non-JsTs root must never be credited with the tsconfig.json note: {writes:?}"
+    );
+    assert!(
+        writes.is_empty(),
+        "go has no other disclosed repo writes: {writes:?}"
+    );
+    // The pre-existing file was never touched.
+    assert_eq!(
+        fs::read_to_string(repo.path().join("tsconfig.json")).unwrap(),
+        "{}\n"
+    );
+}
+
 // `--log-json` was defined but never read (a silent no-op): the plan
 // promised structured logging, but nothing wired the flag to anything.
 // Regression: with it set, tamga's own stderr (children's stdout/stderr go

@@ -64,8 +64,11 @@ pub struct IndexArgs {
     /// fails to resolve (its root degrades) instead of being downloaded,
     /// and every family's network-touching dependency/build-prep step
     /// (venv/npm/yarn/pnpm/bun install, bundle install, composer install,
-    /// dotnet restore, go mod download, cmake/meson configure+build) is
-    /// skipped the same way `--no-install` skips it.
+    /// dotnet restore, cmake/meson configure+build) is skipped the same way
+    /// `--no-install` skips it -- except Go's `go mod download`, which
+    /// `--no-install` deliberately does NOT skip (see below) but this flag
+    /// does, since it's the one such step that actually touches the
+    /// network.
     #[arg(long)]
     pub offline: bool,
     /// Never run per-family dependency/build-prep installs (venv/npm/
