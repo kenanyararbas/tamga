@@ -1,0 +1,53 @@
+---
+source: tests/detect.rs
+expression: "normalized_json(&report, &repo)"
+---
+{
+  "repo": "<REPO>",
+  "roots": [
+    {
+      "id": "backend+python",
+      "family": "python",
+      "dir": "backend",
+      "strength": "project",
+      "evidence": [
+        {
+          "marker": "backend/pyproject.toml",
+          "note": "pyproject.toml (project)"
+        }
+      ],
+      "member_patterns": [],
+      "meta": {
+        "kind": "python"
+      },
+      "subsumed": []
+    },
+    {
+      "id": "frontend+jsts",
+      "family": "jsts",
+      "dir": "frontend",
+      "strength": "project",
+      "evidence": [
+        {
+          "marker": "frontend/package.json",
+          "note": "package.json"
+        },
+        {
+          "marker": "frontend/tsconfig.json",
+          "note": "tsconfig.json"
+        },
+        {
+          "marker": "frontend/pnpm-lock.yaml",
+          "note": "pnpm-lock.yaml (pnpm)"
+        }
+      ],
+      "member_patterns": [],
+      "meta": {
+        "kind": "jsts",
+        "ts_mode": "ts",
+        "package_manager": "pnpm"
+      },
+      "subsumed": []
+    }
+  ]
+}

@@ -1,0 +1,62 @@
+---
+source: tests/detect.rs
+expression: "normalized_json(&report, &repo)"
+---
+{
+  "repo": "<REPO>",
+  "roots": [
+    {
+      "id": "root+jsts",
+      "family": "jsts",
+      "dir": "",
+      "strength": "workspace",
+      "evidence": [
+        {
+          "marker": "package.json",
+          "note": "package.json"
+        },
+        {
+          "marker": "package-lock.json",
+          "note": "package-lock.json (npm)"
+        }
+      ],
+      "member_patterns": [
+        "packages/*"
+      ],
+      "meta": {
+        "kind": "jsts",
+        "ts_mode": "js_only",
+        "package_manager": "npm"
+      },
+      "subsumed": [
+        [
+          "packages/a",
+          "workspace member of <repo root>"
+        ],
+        [
+          "packages/b",
+          "workspace member of <repo root>"
+        ]
+      ]
+    },
+    {
+      "id": "tools-other+jsts",
+      "family": "jsts",
+      "dir": "tools/other",
+      "strength": "project",
+      "evidence": [
+        {
+          "marker": "tools/other/package.json",
+          "note": "package.json"
+        }
+      ],
+      "member_patterns": [],
+      "meta": {
+        "kind": "jsts",
+        "ts_mode": "js_only",
+        "package_manager": "npm"
+      },
+      "subsumed": []
+    }
+  ]
+}

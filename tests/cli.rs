@@ -144,14 +144,71 @@ fn clean_exits_2_on_filesystem_error() {
 }
 
 #[test]
-fn detect_is_a_stub_that_exits_1() {
+fn detect_exits_0_and_lists_a_root_on_a_fixture() {
     let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    fs::write(
+        repo.path().join("pyproject.toml"),
+        "[project]\nname=\"x\"\n",
+    )
+    .unwrap();
+    fs::write(repo.path().join("main.py"), "x = 1\n").unwrap();
+
     tamga()
         .env("TAMGA_HOME", home.path())
         .arg("detect")
+        .arg(repo.path())
         .assert()
-        .code(1)
-        .stderr(predicate::str::contains("not yet implemented"));
+        .success()
+        .stdout(predicate::str::contains("python"));
+}
+
+#[test]
+fn detect_exits_5_on_an_empty_dir() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .arg("detect")
+        .arg(repo.path())
+        .assert()
+        .code(5)
+        .stdout(predicate::str::contains("No roots detected"));
+}
+
+#[test]
+fn detect_json_emits_valid_report() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    fs::write(repo.path().join("go.mod"), "module x\n").unwrap();
+
+    let output = tamga()
+        .env("TAMGA_HOME", home.path())
+        .args(["detect", "--json"])
+        .arg(repo.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: serde_json::Value = serde_json::from_slice(&output).expect("valid JSON");
+    assert_eq!(parsed["roots"][0]["family"], "go");
+}
+
+#[test]
+fn detect_exits_2_on_malformed_repo_config() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    fs::write(repo.path().join(".tamga.toml"), "not = [ valid").unwrap();
+
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .arg("detect")
+        .arg(repo.path())
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("config error"));
 }
 
 #[test]

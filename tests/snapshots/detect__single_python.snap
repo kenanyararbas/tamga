@@ -1,0 +1,26 @@
+---
+source: tests/detect.rs
+expression: "normalized_json(&report, &repo)"
+---
+{
+  "repo": "<REPO>",
+  "roots": [
+    {
+      "id": "root+python",
+      "family": "python",
+      "dir": "",
+      "strength": "project",
+      "evidence": [
+        {
+          "marker": "pyproject.toml",
+          "note": "pyproject.toml (project)"
+        }
+      ],
+      "member_patterns": [],
+      "meta": {
+        "kind": "python"
+      },
+      "subsumed": []
+    }
+  ]
+}
