@@ -276,6 +276,46 @@ mod tests {
     }
 
     #[test]
+    fn real_rust_analyzer_entry_has_a_date_tag_and_bare_gzip_targets() {
+        let manifest = load().unwrap();
+        let ra = manifest.get("rust-analyzer").unwrap();
+        match &ra.dist {
+            DistKind::GithubRelease { repo, tag, targets } => {
+                assert_eq!(repo, "rust-lang/rust-analyzer");
+                // The whole reason `tag` exists: this repo's tags are dates
+                // like `2026-09-07`, not `v<version>`.
+                assert_eq!(tag.as_deref(), Some(ra.version.as_str()));
+                let target = targets.get("aarch64-apple-darwin").unwrap();
+                assert!(
+                    target.asset.ends_with(".gz") && !target.asset.ends_with(".tar.gz"),
+                    "expected a bare gzip asset, got {}",
+                    target.asset
+                );
+                assert_eq!(target.sha256.len(), 64);
+            }
+            other => panic!("expected github-release, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn real_scip_ruby_entry_parses_with_its_own_tag_convention() {
+        let manifest = load().unwrap();
+        let ruby = manifest.get("scip-ruby").unwrap();
+        match &ruby.dist {
+            DistKind::GithubRelease { repo, tag, targets } => {
+                assert_eq!(repo, "sourcegraph/scip-ruby");
+                assert_eq!(
+                    tag.as_deref(),
+                    Some(format!("scip-ruby-v{}", ruby.version)).as_deref()
+                );
+                let target = targets.get("aarch64-apple-darwin").unwrap();
+                assert_eq!(target.sha256.len(), 64);
+            }
+            other => panic!("expected github-release, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn composer_entry_has_package_name() {
         let manifest = load().unwrap();
         let php = manifest.get("scip-php").unwrap();

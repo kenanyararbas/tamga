@@ -1111,3 +1111,73 @@ fn live_scip_python_produces_backend_docs() {
         "expected a backend/ document from scip-python, got: {paths:?}"
     );
 }
+
+/// Whether `rust-analyzer --version` actually runs successfully. Plain
+/// PATH presence isn't enough to trust: a rustup-managed `~/.cargo/bin/`
+/// installs a `rust-analyzer` *proxy* binary for every known component
+/// name regardless of whether that component is actually installed, and
+/// invoking the proxy for a component rustup doesn't have fails loudly
+/// ("Unknown binary 'rust-analyzer' in official toolchain ...") -- a real,
+/// common environment shape this self-skip must not mistake for "present".
+fn rust_analyzer_actually_runs() -> bool {
+    std::process::Command::new("rust-analyzer")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+// Live smoke test (gated): real rust-analyzer on a tiny Cargo fixture.
+// Runs only under `cargo test -- --ignored` with TAMGA_LIVE=1 set and both
+// a genuinely working rust-analyzer and cargo present (self-skips
+// otherwise, e.g. neither is installed, only `~/.cargo/bin` -- not on the
+// test's own PATH -- or (see `rust_analyzer_actually_runs`) a rustup proxy
+// shim is on PATH but the component itself was never installed).
+#[test]
+#[ignore = "requires real rust-analyzer/cargo and TAMGA_LIVE=1"]
+fn live_rust_analyzer_indexes_a_tiny_cargo_fixture() {
+    if std::env::var("TAMGA_LIVE").is_err() {
+        eprintln!("skipping live test: set TAMGA_LIVE=1 to enable");
+        return;
+    }
+    if !rust_analyzer_actually_runs() {
+        eprintln!("skipping live test: rust-analyzer not on PATH (or a non-functional proxy)");
+        return;
+    }
+    if tamga::indexers::find_on_path("cargo").is_none() {
+        eprintln!("skipping live test: cargo not on PATH");
+        return;
+    }
+
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let out = tempdir().unwrap();
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    fs::write(
+        repo.path().join("Cargo.toml"),
+        "[package]\nname = \"tinycargo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join("src/main.rs"),
+        "fn main() {\n    println!(\"hi\");\n}\n",
+    )
+    .unwrap();
+    // No pins: use the real rust-analyzer from PATH.
+
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .args(["index"])
+        .arg(repo.path())
+        .args(["--no-install", "--output"])
+        .arg(out.path())
+        .assert()
+        .code(0);
+
+    let index = read_index(&out.path().join("index.scip"));
+    let paths = doc_paths(&index);
+    assert!(
+        paths.iter().any(|p| p.starts_with("src/")),
+        "expected a src/ document from rust-analyzer, got: {paths:?}"
+    );
+}
