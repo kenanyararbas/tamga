@@ -1487,4 +1487,114 @@ exit 0
 
         assert!(matches!(result, Err(AcquireError::ComposerMissing)));
     }
+
+    // --- coursier + dotnet-tool execution paths (fake cs/dotnet on a
+    //     scratch PATH, never the real tools) --------------------------
+
+    /// A fake `cs` that, on `install ... --install-dir <dir> <app>:<ver>`,
+    /// creates `<dir>/<bin_name>` -- the launcher a real `cs install` drops
+    /// there -- parsed out of its own `--install-dir` argument.
+    fn write_fake_cs_success(dir: &Path, bin_name: &str) {
+        let script = format!(
+            "#!/bin/sh
+install_dir=\"\"
+while [ $# -gt 0 ]; do
+case \"$1\" in
+--install-dir) install_dir=\"$2\"; shift 2 ;;
+*) shift ;;
+esac
+done
+mkdir -p \"$install_dir\"
+printf '#!/bin/sh\\necho 0.13.1\\n' > \"$install_dir/{bin_name}\"
+chmod +x \"$install_dir/{bin_name}\"
+exit 0
+"
+        );
+        write_executable(&dir.join("cs"), script.as_bytes());
+    }
+
+    /// A fake `dotnet` that, on `tool install <pkg> --tool-path <dir>
+    /// --version <ver>`, creates `<dir>/<bin_name>`.
+    fn write_fake_dotnet_success(dir: &Path, bin_name: &str) {
+        let script = format!(
+            "#!/bin/sh
+tool_path=\"\"
+while [ $# -gt 0 ]; do
+case \"$1\" in
+--tool-path) tool_path=\"$2\"; shift 2 ;;
+*) shift ;;
+esac
+done
+mkdir -p \"$tool_path\"
+printf '#!/bin/sh\\necho 0.2.14\\n' > \"$tool_path/{bin_name}\"
+chmod +x \"$tool_path/{bin_name}\"
+exit 0
+"
+        );
+        write_executable(&dir.join("dotnet"), script.as_bytes());
+    }
+
+    #[test]
+    fn install_coursier_success_resolves_the_installed_launcher() {
+        let _guard = path_guard();
+        let path_dir = tempdir().unwrap();
+        write_fake_cs_success(path_dir.path(), "scip-java");
+        let tmp = tempdir().unwrap();
+        let dist = DistKind::Coursier {
+            app: "scip-java".to_string(),
+        };
+
+        let result = with_scratch_path(path_dir.path(), || {
+            install(
+                "scip-java",
+                &dist,
+                "0.13.1",
+                tmp.path(),
+                "scip-java",
+                &FakeFetcher::ok(Vec::new()),
+            )
+        });
+
+        let path = result.expect("fake cs install should succeed");
+        assert_eq!(
+            path,
+            tmp.path()
+                .join("scip-java")
+                .join("0.13.1")
+                .join("scip-java")
+        );
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn install_dotnet_tool_success_resolves_the_installed_launcher() {
+        let _guard = path_guard();
+        let path_dir = tempdir().unwrap();
+        write_fake_dotnet_success(path_dir.path(), "scip-dotnet");
+        let tmp = tempdir().unwrap();
+        let dist = DistKind::DotnetTool {
+            package: "scip-dotnet".to_string(),
+        };
+
+        let result = with_scratch_path(path_dir.path(), || {
+            install(
+                "scip-dotnet",
+                &dist,
+                "0.2.14",
+                tmp.path(),
+                "scip-dotnet",
+                &FakeFetcher::ok(Vec::new()),
+            )
+        });
+
+        let path = result.expect("fake dotnet tool install should succeed");
+        assert_eq!(
+            path,
+            tmp.path()
+                .join("scip-dotnet")
+                .join("0.2.14")
+                .join("scip-dotnet")
+        );
+        assert!(path.is_file());
+    }
 }
