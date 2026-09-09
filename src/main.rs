@@ -2,6 +2,12 @@
 //! command's outcome to a process exit code (see `tamga::report` for the
 //! exit-code mapping used once a real `index` run exists; M0's other
 //! commands each have their own small, fixed mapping documented inline).
+//!
+//! Expected, modeled failures (bad config, an unresolvable home dir) are
+//! handled explicitly below and turned into their specific exit codes.
+//! Anything else -- the "1 = internal error/panic" case -- propagates as
+//! an `anyhow::Error`; returning it from `main` prints it and exits 1,
+//! which is exactly that mapping.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -12,14 +18,15 @@ use tamga::cli::{CleanArgs, Cli, Command, DoctorArgs, IndexersAction};
 use tamga::config::{CliOverrides, TamgaConfig};
 use tamga::workspace::{CleanTarget, Workspace};
 
-fn main() -> ExitCode {
+fn main() -> anyhow::Result<ExitCode> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
-        .init();
+        .try_init()
+        .map_err(|e| anyhow::anyhow!("failed to initialize tracing: {e}"))?;
 
     let cli = Cli::parse();
-    ExitCode::from(dispatch(cli) as u8)
+    Ok(ExitCode::from(dispatch(cli) as u8))
 }
 
 fn dispatch(cli: Cli) -> i32 {
