@@ -15,21 +15,66 @@ struct ToolCheck {
 }
 
 const TOOLS: &[ToolCheck] = &[
-    ToolCheck { name: "git", version_args: &["--version"] },
-    ToolCheck { name: "node", version_args: &["--version"] },
-    ToolCheck { name: "npm", version_args: &["--version"] },
-    ToolCheck { name: "python3", version_args: &["--version"] },
-    ToolCheck { name: "uv", version_args: &["--version"] },
-    ToolCheck { name: "go", version_args: &["version"] },
-    ToolCheck { name: "cargo", version_args: &["--version"] },
-    ToolCheck { name: "rust-analyzer", version_args: &["--version"] },
-    ToolCheck { name: "java", version_args: &["-version"] },
-    ToolCheck { name: "dotnet", version_args: &["--version"] },
-    ToolCheck { name: "cmake", version_args: &["--version"] },
-    ToolCheck { name: "bear", version_args: &["--version"] },
-    ToolCheck { name: "bundle", version_args: &["--version"] },
-    ToolCheck { name: "composer", version_args: &["--version"] },
-    ToolCheck { name: "php", version_args: &["--version"] },
+    ToolCheck {
+        name: "git",
+        version_args: &["--version"],
+    },
+    ToolCheck {
+        name: "node",
+        version_args: &["--version"],
+    },
+    ToolCheck {
+        name: "npm",
+        version_args: &["--version"],
+    },
+    ToolCheck {
+        name: "python3",
+        version_args: &["--version"],
+    },
+    ToolCheck {
+        name: "uv",
+        version_args: &["--version"],
+    },
+    ToolCheck {
+        name: "go",
+        version_args: &["version"],
+    },
+    ToolCheck {
+        name: "cargo",
+        version_args: &["--version"],
+    },
+    ToolCheck {
+        name: "rust-analyzer",
+        version_args: &["--version"],
+    },
+    ToolCheck {
+        name: "java",
+        version_args: &["-version"],
+    },
+    ToolCheck {
+        name: "dotnet",
+        version_args: &["--version"],
+    },
+    ToolCheck {
+        name: "cmake",
+        version_args: &["--version"],
+    },
+    ToolCheck {
+        name: "bear",
+        version_args: &["--version"],
+    },
+    ToolCheck {
+        name: "bundle",
+        version_args: &["--version"],
+    },
+    ToolCheck {
+        name: "composer",
+        version_args: &["--version"],
+    },
+    ToolCheck {
+        name: "php",
+        version_args: &["--version"],
+    },
 ];
 
 /// Outcome of probing a single tool.
@@ -109,7 +154,10 @@ mod tests {
     #[test]
     fn describe_output_falls_back_to_stderr() {
         // e.g. `java -version` prints to stderr.
-        assert_eq!(describe_output(b"", b"openjdk 21\n", "fallback"), "openjdk 21");
+        assert_eq!(
+            describe_output(b"", b"openjdk 21\n", "fallback"),
+            "openjdk 21"
+        );
     }
 
     #[test]
@@ -125,8 +173,16 @@ mod tests {
     #[test]
     fn format_report_aligns_names_and_one_line_per_tool() {
         let statuses = vec![
-            ToolStatus { name: "git".to_string(), found: true, detail: "git version 2.43.0".to_string() },
-            ToolStatus { name: "rust-analyzer".to_string(), found: false, detail: "missing".to_string() },
+            ToolStatus {
+                name: "git".to_string(),
+                found: true,
+                detail: "git version 2.43.0".to_string(),
+            },
+            ToolStatus {
+                name: "rust-analyzer".to_string(),
+                found: false,
+                detail: "missing".to_string(),
+            },
         ];
         let report = format_report(&statuses);
         let lines: Vec<&str> = report.lines().collect();
@@ -151,7 +207,10 @@ mod tests {
     #[test]
     fn check_tool_reports_found_for_cargo_itself() {
         // Running under `cargo test` guarantees cargo is on PATH.
-        let check = ToolCheck { name: "cargo", version_args: &["--version"] };
+        let check = ToolCheck {
+            name: "cargo",
+            version_args: &["--version"],
+        };
         let status = check_tool(&check);
         assert!(status.found);
         assert!(status.detail.to_lowercase().contains("cargo"));
@@ -160,7 +219,11 @@ mod tests {
     #[test]
     fn run_covers_git_and_returns_nonempty_report() {
         let report = run(None);
-        assert!(report.lines().any(|line| line.trim_start().starts_with("git")));
+        assert!(
+            report
+                .lines()
+                .any(|line| line.trim_start().starts_with("git"))
+        );
         assert_eq!(report.lines().count(), TOOLS.len());
     }
 }

@@ -101,7 +101,15 @@ fn merge_is_a_stub_that_exits_1() {
     let home = tempdir().unwrap();
     tamga()
         .env("TAMGA_HOME", home.path())
-        .args(["merge", "a.scip", "b.scip", "--repo-root", ".", "-o", "out.scip"])
+        .args([
+            "merge",
+            "a.scip",
+            "b.scip",
+            "--repo-root",
+            ".",
+            "-o",
+            "out.scip",
+        ])
         .assert()
         .code(1)
         .stderr(predicate::str::contains("not yet implemented"));

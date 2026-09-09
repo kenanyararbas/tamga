@@ -174,11 +174,10 @@ fn load_partial_file(path: &Path) -> Result<Option<PartialConfig>, ConfigError> 
             });
         }
     };
-    let partial: PartialConfig =
-        toml::from_str(&text).map_err(|source| ConfigError::Parse {
-            path: path.display().to_string(),
-            source,
-        })?;
+    let partial: PartialConfig = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+        path: path.display().to_string(),
+        source,
+    })?;
     Ok(Some(partial))
 }
 
@@ -261,8 +260,7 @@ mod tests {
         fs::write(home.path().join("config.toml"), "[run]\njobs = 8\n").unwrap();
         fs::write(repo.path().join(".tamga.toml"), "[run]\njobs = 16\n").unwrap();
         let cfg =
-            load_effective_config(home.path(), Some(repo.path()), CliOverrides::default())
-                .unwrap();
+            load_effective_config(home.path(), Some(repo.path()), CliOverrides::default()).unwrap();
         assert_eq!(cfg.run.jobs, 16);
     }
 
@@ -288,8 +286,7 @@ mod tests {
         // Repo layer sets an unrelated key; jobs must survive from home.
         fs::write(repo.path().join(".tamga.toml"), "[scan]\nmax_depth = 4\n").unwrap();
         let cfg =
-            load_effective_config(home.path(), Some(repo.path()), CliOverrides::default())
-                .unwrap();
+            load_effective_config(home.path(), Some(repo.path()), CliOverrides::default()).unwrap();
         assert_eq!(cfg.run.jobs, 8);
         assert_eq!(cfg.scan.max_depth, 4);
     }

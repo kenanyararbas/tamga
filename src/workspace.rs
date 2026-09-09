@@ -26,7 +26,10 @@ impl fmt::Display for WorkspaceError {
         match self {
             WorkspaceError::Io(e) => write!(f, "workspace I/O error: {e}"),
             WorkspaceError::HomeUnresolvable => {
-                write!(f, "could not determine tamga home directory (no TAMGA_HOME or HOME)")
+                write!(
+                    f,
+                    "could not determine tamga home directory (no TAMGA_HOME or HOME)"
+                )
             }
         }
     }
@@ -52,7 +55,9 @@ impl Workspace {
     pub fn resolve() -> Result<Self, WorkspaceError> {
         if let Some(home) = std::env::var_os("TAMGA_HOME") {
             if !home.is_empty() {
-                return Ok(Workspace { home: PathBuf::from(home) });
+                return Ok(Workspace {
+                    home: PathBuf::from(home),
+                });
             }
         }
         let home_dir = std::env::var_os("HOME").ok_or(WorkspaceError::HomeUnresolvable)?;
@@ -157,10 +162,7 @@ impl RunWorkspace {
 /// `runs_dir` (by name, which sorts chronologically for our run-id
 /// format) and deletes the rest. Returns the paths that were removed.
 /// Never touches `envs/` or `tools/` — callers only ever pass `runs_dir`.
-pub fn enforce_run_retention(
-    runs_dir: &Path,
-    keep: u32,
-) -> Result<Vec<PathBuf>, WorkspaceError> {
+pub fn enforce_run_retention(runs_dir: &Path, keep: u32) -> Result<Vec<PathBuf>, WorkspaceError> {
     let mut entries: Vec<PathBuf> = match std::fs::read_dir(runs_dir) {
         Ok(read_dir) => read_dir
             .filter_map(|e| e.ok())
@@ -198,7 +200,10 @@ pub enum CleanTarget {
 /// Removes the requested top-level directories entirely (not just their
 /// contents) and returns the paths that were removed. Missing directories
 /// are silently skipped.
-pub fn clean(workspace: &Workspace, targets: &[CleanTarget]) -> Result<Vec<PathBuf>, WorkspaceError> {
+pub fn clean(
+    workspace: &Workspace,
+    targets: &[CleanTarget],
+) -> Result<Vec<PathBuf>, WorkspaceError> {
     let mut removed = Vec::new();
     for target in targets {
         let dir = match target {
@@ -307,7 +312,11 @@ mod tests {
         let home = tempdir().unwrap();
         let ws = Workspace::at(home.path());
         ws.ensure_dirs().unwrap();
-        for id in ["20260101-000000-aaaa", "20260102-000000-bbbb", "20260103-000000-cccc"] {
+        for id in [
+            "20260101-000000-aaaa",
+            "20260102-000000-bbbb",
+            "20260103-000000-cccc",
+        ] {
             make_fake_run_dir(&ws.runs_dir(), id);
         }
         std::fs::write(ws.envs_dir().join("marker"), b"keep me").unwrap();
@@ -340,7 +349,11 @@ mod tests {
         let ws = Workspace::at(home.path());
         ws.ensure_dirs().unwrap();
 
-        let removed = clean(&ws, &[CleanTarget::Runs, CleanTarget::Envs, CleanTarget::Tools]).unwrap();
+        let removed = clean(
+            &ws,
+            &[CleanTarget::Runs, CleanTarget::Envs, CleanTarget::Tools],
+        )
+        .unwrap();
 
         assert!(!ws.runs_dir().exists());
         assert!(!ws.envs_dir().exists());
