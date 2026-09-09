@@ -9,6 +9,7 @@ pub mod cli;
 pub mod config;
 pub mod detect;
 pub mod doctor;
+pub mod exec;
 pub mod families;
 pub mod report;
 pub mod workspace;
