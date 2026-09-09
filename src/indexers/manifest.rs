@@ -417,6 +417,35 @@ mod tests {
     }
 
     #[test]
+    fn real_manifest_has_the_m7_indexer() {
+        let manifest = load().expect("assets/indexers.toml must parse");
+        let clang = manifest.get("scip-clang").expect("scip-clang in manifest");
+        assert_eq!(clang.version, "0.4.0");
+        match &clang.dist {
+            DistKind::GithubRelease { repo, tag, targets } => {
+                assert_eq!(repo, "sourcegraph/scip-clang");
+                // v0.4.0's tag literally IS "v0.4.0" -- no explicit `tag`
+                // override needed, unlike rust-analyzer/scip-ruby.
+                assert_eq!(*tag, None);
+                let darwin = targets.get("aarch64-apple-darwin").unwrap();
+                assert_eq!(darwin.asset, "scip-clang-arm64-darwin");
+                assert_eq!(darwin.sha256.len(), 64);
+                let linux = targets.get("x86_64-unknown-linux-gnu").unwrap();
+                assert_eq!(linux.asset, "scip-clang-x86_64-linux");
+                assert_eq!(linux.sha256.len(), 64);
+                // The real upstream gap: no Linux arm64 asset is published
+                // at all (contrary to the brief's guess that the gap might
+                // be on macOS arm64 -- that target DOES ship a binary).
+                assert!(
+                    !targets.contains_key("aarch64-unknown-linux-gnu"),
+                    "expected no aarch64-unknown-linux-gnu target for scip-clang"
+                );
+            }
+            other => panic!("expected github-release, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn composer_entry_has_package_name() {
         let manifest = load().unwrap();
         let php = manifest.get("scip-php").unwrap();

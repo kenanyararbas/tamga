@@ -922,6 +922,122 @@ mod tests {
         );
     }
 
+    // --- M7: scip-clang acquisition -----------------------------------------
+    //
+    // The install/resolve codepath for `github-release` dist is fully
+    // generic (already exercised above for scip-go); these two tests just
+    // confirm `IndexerId::ScipClang` is wired through it end to end, using
+    // synthetic manifests (never the real embedded one, which carries real
+    // checksums a fake fetcher's fabricated bytes could never match).
+
+    #[test]
+    fn scip_clang_installs_via_the_fake_fetcher_then_resolves_from_cache() {
+        let _guard = path_guard();
+        let (_ws_dir, workspace, _unused) = empty_ctx();
+        let triple = acquire::host_target_triple().unwrap();
+
+        let bytes = {
+            let mut buf = Vec::new();
+            {
+                let enc = flate2::write::GzEncoder::new(&mut buf, flate2::Compression::default());
+                let data = b"#!/bin/sh\necho 0.4.0\n";
+                use std::io::Write as _;
+                let mut enc = enc;
+                enc.write_all(data).unwrap();
+                enc.finish().unwrap();
+            }
+            buf
+        };
+        let sha = hex::encode(Sha256::digest(&bytes));
+        let src = format!(
+            r#"
+            [scip-clang]
+            version = "0.4.0"
+            dist = "github-release"
+            repo = "sourcegraph/scip-clang"
+
+            [scip-clang.targets.{triple}]
+            asset = "scip-clang-{triple}.gz"
+            sha256 = "{sha}"
+            "#
+        );
+        let manifest = manifest::parse(&src).unwrap();
+
+        struct BytesFetcher {
+            bytes: Vec<u8>,
+            calls: AtomicUsize,
+        }
+        impl Fetcher for BytesFetcher {
+            fn fetch(&self, _url: &str) -> Result<Vec<u8>, AcquireError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(self.bytes.clone())
+            }
+        }
+
+        let cfg = TamgaConfig::default();
+        let fetcher = BytesFetcher {
+            bytes,
+            calls: AtomicUsize::new(0),
+        };
+        let opts = ResolveOptions {
+            workspace: &workspace,
+            manifest: &manifest,
+            offline: false,
+            fetcher: &fetcher,
+        };
+
+        let resolved = resolve(IndexerId::ScipClang, &cfg, &opts).unwrap();
+        assert_eq!(resolved.resolved_from, ResolvedFrom::Downloaded);
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+
+        let resolved_again = resolve(IndexerId::ScipClang, &cfg, &opts).unwrap();
+        assert_eq!(resolved_again.resolved_from, ResolvedFrom::Cache);
+        assert_eq!(
+            fetcher.calls.load(Ordering::SeqCst),
+            1,
+            "the cache hit must not fetch again"
+        );
+    }
+
+    #[test]
+    fn scip_clang_degrades_honestly_on_the_real_linux_arm64_platform_gap() {
+        let _guard = path_guard();
+        let (_ws_dir, workspace, _unused) = empty_ctx();
+        // A manifest that only ever ships the one real upstream gap
+        // (aarch64-unknown-linux-gnu -- see assets/indexers.toml's M7
+        // comment): whatever the actual test host is (macOS arm64 or
+        // Linux x86_64, both of which DO have a real asset), resolution
+        // must degrade with the exact "no prebuilt binary" reason rather
+        // than silently falling back to something else.
+        let src = r#"
+            [scip-clang]
+            version = "0.4.0"
+            dist = "github-release"
+            repo = "sourcegraph/scip-clang"
+
+            [scip-clang.targets.aarch64-unknown-linux-gnu]
+            asset = "scip-clang-linux-arm64"
+            sha256 = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+            "#;
+        let manifest = manifest::parse(src).unwrap();
+        let cfg = TamgaConfig::default();
+        let fetcher = CountingFetcher::new();
+        let opts = ResolveOptions {
+            workspace: &workspace,
+            manifest: &manifest,
+            offline: false,
+            fetcher: &fetcher,
+        };
+
+        let err = resolve(IndexerId::ScipClang, &cfg, &opts).unwrap_err();
+        let host_triple = acquire::host_target_triple().unwrap();
+        assert_eq!(
+            err,
+            format!("no prebuilt scip-clang binary for this platform ({host_triple})")
+        );
+        assert_eq!(fetcher.calls(), 0, "a platform gap must never fetch");
+    }
+
     #[test]
     fn path_beats_cache() {
         let _guard = path_guard();

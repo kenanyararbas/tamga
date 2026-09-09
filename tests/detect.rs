@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use tamga::config::{ScanConfig, TamgaConfig};
 use tamga::detect::{DetectionReport, ResolvedRoot, RootStrength, detect};
-use tamga::families::{FamilyId, FamilyMeta, JvmBuildTool, PackageManager, TsMode};
+use tamga::families::{ClangStrategy, FamilyId, FamilyMeta, JvmBuildTool, PackageManager, TsMode};
 use tempfile::{TempDir, tempdir};
 
 // ---- fixture helpers -------------------------------------------------
@@ -883,6 +883,163 @@ fn m6_case5_dotnet_sln_subsumption_multi_sln_orphan_and_global_json() {
         }
     );
     assert!(orphan.subsumed.is_empty());
+}
+
+// ---- M7: Clang (C/C++) family ------------------------------------------
+
+// M7 case 1: CMakeLists root + nested CMakeLists + nested Makefile -> 1
+// root, strategy CMake, both nested markers subsumed with reasons.
+#[test]
+fn m7_case1_cmakelists_root_subsumes_nested_cmakelists_and_makefile() {
+    let repo = tempdir().unwrap();
+    write(repo.path(), "CMakeLists.txt", "project(app)\n");
+    write(repo.path(), "src/lib/CMakeLists.txt", "add_library(lib)\n");
+    write(repo.path(), "third_party/lib/Makefile", "all:\n\techo hi\n");
+
+    let report = run(repo.path());
+    assert_eq!(ids(&report), vec!["root+clang"]);
+
+    let root = find(&report, "").unwrap();
+    assert_eq!(root.candidate.family, FamilyId::Clang);
+    assert_eq!(root.candidate.strength, RootStrength::Workspace);
+    assert_eq!(
+        root.candidate.meta,
+        FamilyMeta::Clang {
+            strategy: ClangStrategy::Cmake
+        }
+    );
+    assert_eq!(
+        subsumed_dirs(root),
+        vec!["src/lib".to_string(), "third_party/lib".to_string()]
+    );
+    for (_, reason) in &root.subsumed {
+        assert!(!reason.is_empty(), "subsume reason must be non-empty");
+    }
+}
+
+// M7 case 2: root compile_commands.json + a co-located CMakeLists.txt ->
+// ExistingCompdb wins (strongest), both markers recorded in evidence.
+#[test]
+fn m7_case2_existing_compdb_wins_over_colocated_cmakelists() {
+    let repo = tempdir().unwrap();
+    write(repo.path(), "compile_commands.json", "[]");
+    write(repo.path(), "CMakeLists.txt", "project(app)\n");
+
+    let report = run(repo.path());
+    assert_eq!(ids(&report), vec!["root+clang"]);
+    let root = find(&report, "").unwrap();
+    assert_eq!(
+        root.candidate.meta,
+        FamilyMeta::Clang {
+            strategy: ClangStrategy::ExistingCompdb
+        }
+    );
+    assert_eq!(root.candidate.strength, RootStrength::Workspace);
+    let markers: Vec<String> = root
+        .candidate
+        .evidence
+        .iter()
+        .filter_map(|e| e.marker.as_ref().map(|m| m.to_string_lossy().into_owned()))
+        .collect();
+    assert!(
+        markers.contains(&"compile_commands.json".to_string()),
+        "{markers:?}"
+    );
+    assert!(
+        markers.contains(&"CMakeLists.txt".to_string()),
+        "{markers:?}"
+    );
+}
+
+// M7 case 3: meson.build root + a SIBLING independent Makefile tree -> 2
+// roots (Meson + Make), neither subsuming the other (not nested).
+#[test]
+fn m7_case3_meson_root_and_sibling_makefile_tree_are_two_roots() {
+    let repo = tempdir().unwrap();
+    write(repo.path(), "app/meson.build", "project('app')\n");
+    write(repo.path(), "toollib/Makefile", "all:\n\techo hi\n");
+
+    let report = run(repo.path());
+    assert_eq!(ids(&report), vec!["app+clang", "toollib+clang"]);
+
+    let app = find(&report, "app").unwrap();
+    assert_eq!(
+        app.candidate.meta,
+        FamilyMeta::Clang {
+            strategy: ClangStrategy::Meson
+        }
+    );
+    assert_eq!(app.candidate.strength, RootStrength::Workspace);
+    assert!(app.subsumed.is_empty());
+
+    let toollib = find(&report, "toollib").unwrap();
+    assert_eq!(
+        toollib.candidate.meta,
+        FamilyMeta::Clang {
+            strategy: ClangStrategy::Make
+        }
+    );
+    assert_eq!(toollib.candidate.strength, RootStrength::Project);
+    assert!(toollib.subsumed.is_empty());
+}
+
+// M7 case 4: configure.ac alone (no Makefile, no CMakeLists/meson.build) ->
+// a Weak Autotools root.
+#[test]
+fn m7_case4_configure_ac_only_is_a_weak_autotools_root() {
+    let repo = tempdir().unwrap();
+    write(repo.path(), "configure.ac", "AC_INIT([app], [1.0])\n");
+
+    let report = run(repo.path());
+    assert_eq!(ids(&report), vec!["root+clang"]);
+    let root = find(&report, "").unwrap();
+    assert_eq!(root.candidate.strength, RootStrength::Weak);
+    assert_eq!(
+        root.candidate.meta,
+        FamilyMeta::Clang {
+            strategy: ClangStrategy::Autotools
+        }
+    );
+}
+
+// M7 case 5: a compile_commands.json inside build/ is NOT a detection hit
+// -- the walker's built-in ignore overlay already prunes build/ (and
+// cmake-build-*/), so a CMakeLists.txt root's strategy stays CMake, not
+// ExistingCompdb, and no separate root is minted for the ignored dir.
+#[test]
+fn m7_case5_compdb_inside_build_dir_is_overlay_ignored() {
+    let repo = tempdir().unwrap();
+    write(repo.path(), "CMakeLists.txt", "project(app)\n");
+    write(repo.path(), "build/compile_commands.json", "[]");
+
+    let report = run(repo.path());
+    assert_eq!(ids(&report), vec!["root+clang"]);
+    let root = find(&report, "").unwrap();
+    assert_eq!(
+        root.candidate.meta,
+        FamilyMeta::Clang {
+            strategy: ClangStrategy::Cmake
+        }
+    );
+    assert!(
+        root.candidate
+            .evidence
+            .iter()
+            .all(|e| e.marker.as_deref() != Some(Path::new("build/compile_commands.json"))),
+        "build/compile_commands.json must not surface as evidence"
+    );
+}
+
+// A repo-root-only compdb with nothing else present is still a valid
+// (unnested) ExistingCompdb root, confirming rule 5 above isn't
+// accidentally dropping every compdb-only root.
+#[test]
+fn m7_bare_existing_compdb_at_root_is_a_root() {
+    let repo = tempdir().unwrap();
+    write(repo.path(), "compile_commands.json", "[]");
+
+    let report = run(repo.path());
+    assert_eq!(ids(&report), vec!["root+clang"]);
 }
 
 // ---- snapshots -------------------------------------------------------

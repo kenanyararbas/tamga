@@ -1876,3 +1876,737 @@ fn live_scip_dotnet_install_and_index_a_tiny_project() {
         );
     }
 }
+
+// ---- M7: Clang (C/C++) pipeline integration ----------------------------
+//
+// scip-clang is config-pinned to the fake-indexer binary (which now
+// understands `--index-output-path`, scip-clang's real flag, as a synonym
+// for `--output`); `cmake`/`meson`/`bear` are faked with tiny POSIX-sh
+// scripts on a scratch PATH that record their own argv (as
+// `===BEGIN===`/one-arg-per-line/`===END===` blocks, robust to paths with
+// no embedded shell metacharacters) and materialize the
+// `compile_commands.json` a real invocation would leave behind, so the
+// rest of the pipeline (index step, rebase, report) runs against a real,
+// if content-empty, compdb file.
+
+/// Parses a fake-tool records file into one `Vec<String>` (argv) per
+/// recorded invocation, in the order they were appended.
+fn read_argv_records(path: &Path) -> Vec<Vec<String>> {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    let mut out = Vec::new();
+    let mut current: Option<Vec<String>> = None;
+    for line in text.lines() {
+        match line {
+            "===BEGIN===" => current = Some(Vec::new()),
+            "===END===" => {
+                if let Some(args) = current.take() {
+                    out.push(args);
+                }
+            }
+            _ => {
+                if let Some(args) = current.as_mut() {
+                    args.push(line.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A fake `cmake` on `dir`: records every invocation's argv to `records`,
+/// then -- whenever `-B <dir>` or `--build <dir>` appears in argv (real
+/// cmake's own configure/build flags) -- `mkdir -p`s that dir and writes a
+/// (structurally valid, content-empty) `compile_commands.json` into it,
+/// mirroring `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`'s real effect.
+fn write_fake_cmake(dir: &Path, records: &Path) {
+    let script = format!(
+        "#!/bin/sh\n\
+         {{\n  echo '===BEGIN==='\n  for a in \"$@\"; do printf '%s\\n' \"$a\"; done\n  echo '===END==='\n}} >> {records:?}\n\
+         build_dir=\"\"\n\
+         prev=\"\"\n\
+         for a in \"$@\"; do\n\
+         \x20 if [ \"$prev\" = \"-B\" ] || [ \"$prev\" = \"--build\" ]; then build_dir=\"$a\"; fi\n\
+         \x20 prev=\"$a\"\n\
+         done\n\
+         if [ -n \"$build_dir\" ]; then\n\
+         \x20 mkdir -p \"$build_dir\"\n\
+         \x20 echo '[]' > \"$build_dir/compile_commands.json\"\n\
+         fi\n\
+         exit 0\n",
+        records = records.display().to_string().replace('"', "\\\"")
+    );
+    write_executable(&dir.join("cmake"), script.as_bytes());
+}
+
+/// A fake `meson`: records argv the same way as [`write_fake_cmake`];
+/// `setup <build_dir> <root>` materializes the compdb; `compile -C
+/// <build_dir>` exits non-zero when `fail_compile` is set (to exercise the
+/// brief's "induced compile failure still indexes with a note" case) and
+/// zero otherwise.
+fn write_fake_meson(dir: &Path, records: &Path, fail_compile: bool) {
+    let fail = if fail_compile { "9" } else { "0" };
+    let script = format!(
+        "#!/bin/sh\n\
+         {{\n  echo '===BEGIN==='\n  for a in \"$@\"; do printf '%s\\n' \"$a\"; done\n  echo '===END==='\n}} >> {records:?}\n\
+         if [ \"$1\" = setup ]; then\n\
+         \x20 build_dir=\"$2\"\n\
+         \x20 mkdir -p \"$build_dir\"\n\
+         \x20 echo '[]' > \"$build_dir/compile_commands.json\"\n\
+         \x20 exit 0\n\
+         fi\n\
+         if [ \"$1\" = compile ]; then\n\
+         \x20 exit {fail}\n\
+         fi\n\
+         exit 0\n",
+        records = records.display().to_string().replace('"', "\\\"")
+    );
+    write_executable(&dir.join("meson"), script.as_bytes());
+}
+
+/// A fake `bear`: records argv, then -- given `--output <path>` (real
+/// bear's own flag) -- materializes a compdb at exactly that path, WITHOUT
+/// ever executing the trailing `-- make ...` for real (a pure test double,
+/// same philosophy as this suite's other fake package-manager scripts).
+fn write_fake_bear(dir: &Path, records: &Path) {
+    let script = format!(
+        "#!/bin/sh\n\
+         {{\n  echo '===BEGIN==='\n  for a in \"$@\"; do printf '%s\\n' \"$a\"; done\n  echo '===END==='\n}} >> {records:?}\n\
+         out=\"\"\n\
+         prev=\"\"\n\
+         for a in \"$@\"; do\n\
+         \x20 if [ \"$prev\" = \"--output\" ]; then out=\"$a\"; fi\n\
+         \x20 prev=\"$a\"\n\
+         done\n\
+         if [ -n \"$out\" ]; then\n\
+         \x20 mkdir -p \"$(dirname \"$out\")\"\n\
+         \x20 echo '[]' > \"$out\"\n\
+         fi\n\
+         exit 0\n",
+        records = records.display().to_string().replace('"', "\\\"")
+    );
+    write_executable(&dir.join("bear"), script.as_bytes());
+}
+
+fn write_executable(path: &Path, contents: &[u8]) {
+    fs::write(path, contents).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// The `<env>/build` dir a Clang root at the repo root would use, computed
+/// the same way the pipeline itself does (root id + manifest hash), so
+/// tests can assert on the exact path without reaching into pipeline
+/// internals.
+fn clang_env_build_dir(home: &Path, repo: &Path) -> PathBuf {
+    use tamga::families::FamilyId;
+    let repo_canon = fs::canonicalize(repo).unwrap();
+    let root_id = tamga::families::root_id(Path::new(""), FamilyId::Clang);
+    let manifest = tamga::prepare::manifest_files(FamilyId::Clang, &repo_canon, Path::new(""));
+    let hash = tamga::prepare::manifest_hash(&manifest);
+    tamga::workspace::Workspace::at(home)
+        .env_cache_dir(&root_id, &hash)
+        .join("build")
+}
+
+fn write_scip_clang_pin(repo: &Path, extra_args: &str) {
+    let fake = fake_indexer();
+    let fake = fake.to_str().unwrap();
+    fs::write(
+        repo.join(".tamga.toml"),
+        format!("[indexers.scip-clang]\npath = \"{fake}\"\nargs = [{extra_args}]\n"),
+    )
+    .unwrap();
+}
+
+// 6. CMake strategy: both steps' argv exact (incl.
+// -DCMAKE_EXPORT_COMPILE_COMMANDS=ON, -B into the env dir), full-build
+// default runs both steps, and the compdb path handed to prepare's cmake
+// steps is the exact one handed to the indexer's own argv.
+#[test]
+fn m7_case1_cmake_strategy_full_build_argv_exact_and_compdb_path_reaches_indexer() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let ws = tempdir().unwrap();
+    let path_dir = tempdir().unwrap();
+    let records = home.path().join("cmake-records.txt");
+    write_fake_cmake(path_dir.path(), &records);
+
+    fs::write(repo.path().join("CMakeLists.txt"), "project(app c)\n").unwrap();
+    fs::write(repo.path().join("main.c"), "int main(void) { return 0; }\n").unwrap();
+    write_scip_clang_pin(repo.path(), "\"--scip-doc\", \"main.c\"");
+    let record_path = home.path().join("indexer-records.jsonl");
+
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .env("PATH", scratch_path(path_dir.path()))
+        .env("FAKE_RECORD_PATH", &record_path)
+        .args(["index"])
+        .arg(repo.path())
+        .arg("--workspace")
+        .arg(ws.path())
+        .assert()
+        .code(0);
+
+    let report = read_report(&ws.path().join("out"));
+    let root = root_by_dir(&report, ".");
+    assert_eq!(root["status"], "Indexed", "root: {root:#}");
+    assert!(has_step(root, "cmake-configure"), "root: {root:#}");
+    assert!(has_step(root, "cmake-build"), "root: {root:#}");
+
+    let repo_canon = fs::canonicalize(repo.path()).unwrap();
+    let build_dir = clang_env_build_dir(home.path(), repo.path());
+    let invocations = read_argv_records(&records);
+    assert_eq!(
+        invocations,
+        vec![
+            vec![
+                "-S".to_string(),
+                repo_canon.display().to_string(),
+                "-B".to_string(),
+                build_dir.display().to_string(),
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON".to_string(),
+            ],
+            vec!["--build".to_string(), build_dir.display().to_string(),],
+        ],
+        "cmake invocations: {invocations:#?}"
+    );
+
+    // The index step's own argv carries the exact same compdb path.
+    let records_json = read_records(&record_path);
+    let index_record = records_json
+        .iter()
+        .find(|r| {
+            r["argv"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|v| v == "--index-output-path"))
+        })
+        .expect("an index-step record");
+    let argv: Vec<&str> = index_record["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    let compdb_pos = argv
+        .iter()
+        .position(|a| *a == "--compdb-path")
+        .expect("--compdb-path in argv");
+    assert_eq!(
+        argv[compdb_pos + 1],
+        build_dir.join("compile_commands.json").to_str().unwrap()
+    );
+}
+
+// 6b. `families.clang.build = "configure"` skips the cmake --build step
+// entirely -- only the configure invocation runs.
+#[test]
+fn m7_case1b_cmake_build_configure_config_skips_the_build_step() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let ws = tempdir().unwrap();
+    let path_dir = tempdir().unwrap();
+    let records = home.path().join("cmake-records.txt");
+    write_fake_cmake(path_dir.path(), &records);
+
+    fs::write(repo.path().join("CMakeLists.txt"), "project(app c)\n").unwrap();
+    fs::write(repo.path().join("main.c"), "int main(void) { return 0; }\n").unwrap();
+    let fake = fake_indexer();
+    let fake = fake.to_str().unwrap();
+    fs::write(
+        repo.path().join(".tamga.toml"),
+        format!(
+            "[indexers.scip-clang]\npath = \"{fake}\"\nargs = [\"--scip-doc\", \"main.c\"]\n\
+             [families.clang]\nbuild = \"configure\"\n"
+        ),
+    )
+    .unwrap();
+
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .env("PATH", scratch_path(path_dir.path()))
+        .args(["index"])
+        .arg(repo.path())
+        .arg("--workspace")
+        .arg(ws.path())
+        .assert()
+        .code(0);
+
+    let report = read_report(&ws.path().join("out"));
+    let root = root_by_dir(&report, ".");
+    assert_eq!(root["status"], "Indexed", "root: {root:#}");
+    assert!(has_step(root, "cmake-configure"));
+    assert!(!has_step(root, "cmake-build"), "root: {root:#}");
+
+    let invocations = read_argv_records(&records);
+    assert_eq!(
+        invocations.len(),
+        1,
+        "only the configure invocation should have run: {invocations:#?}"
+    );
+}
+
+// 7. Existing-compdb probe: a leftover compdb in a conventional `build/`
+// dir is used directly (no cmake invocation at all -- PATH has no cmake on
+// it), and the choice is stable across two independent runs.
+#[test]
+fn m7_case2_existing_compdb_probe_finds_build_dir_leftover_deterministically() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    fs::write(repo.path().join("CMakeLists.txt"), "project(app c)\n").unwrap();
+    fs::write(repo.path().join("main.c"), "int main(void) { return 0; }\n").unwrap();
+    fs::create_dir_all(repo.path().join("build")).unwrap();
+    fs::write(repo.path().join("build/compile_commands.json"), "[]").unwrap();
+    fs::create_dir_all(repo.path().join("cmake-build-debug")).unwrap();
+    fs::write(
+        repo.path().join("cmake-build-debug/compile_commands.json"),
+        "[]",
+    )
+    .unwrap();
+    write_scip_clang_pin(repo.path(), "\"--scip-doc\", \"main.c\"");
+    let repo_canon = fs::canonicalize(repo.path()).unwrap();
+    let expected_compdb = repo_canon.join("build/compile_commands.json");
+
+    for _ in 0..2 {
+        let out = tempdir().unwrap();
+        let record_dir = tempdir().unwrap();
+        let record_path = record_dir.path().join("records.jsonl");
+        tamga()
+            .env("TAMGA_HOME", home.path())
+            .env("PATH", "") // no cmake anywhere: the probe must never need it
+            .env("FAKE_RECORD_PATH", &record_path)
+            .args(["index"])
+            .arg(repo.path())
+            .args(["--output"])
+            .arg(out.path())
+            .assert()
+            .code(0);
+
+        let report = read_report(out.path());
+        let root = root_by_dir(&report, ".");
+        assert_eq!(root["status"], "Indexed", "root: {root:#}");
+        assert!(
+            !has_step(root, "cmake-configure"),
+            "an existing compdb must skip cmake entirely: {root:#}"
+        );
+
+        let records_json = read_records(&record_path);
+        let index_record = records_json
+            .iter()
+            .find(|r| {
+                r["argv"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|v| v == "--compdb-path"))
+            })
+            .expect("an index-step record");
+        let argv: Vec<&str> = index_record["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        let pos = argv.iter().position(|a| *a == "--compdb-path").unwrap();
+        assert_eq!(argv[pos + 1], expected_compdb.to_str().unwrap());
+    }
+}
+
+// 8. Meson strategy: exact setup/compile argv, and an induced compile
+// failure (stop_on_fail=false) still reaches Indexed, with a note.
+#[test]
+fn m7_case3_meson_strategy_argv_and_failed_compile_still_indexes_with_a_note() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let ws = tempdir().unwrap();
+    let path_dir = tempdir().unwrap();
+    let records = home.path().join("meson-records.txt");
+    write_fake_meson(path_dir.path(), &records, true);
+
+    fs::write(repo.path().join("meson.build"), "project('app', 'c')\n").unwrap();
+    fs::write(repo.path().join("main.c"), "int main(void) { return 0; }\n").unwrap();
+    write_scip_clang_pin(repo.path(), "\"--scip-doc\", \"main.c\"");
+
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .env("PATH", scratch_path(path_dir.path()))
+        .args(["index"])
+        .arg(repo.path())
+        .arg("--workspace")
+        .arg(ws.path())
+        .assert()
+        .code(0);
+
+    let report = read_report(&ws.path().join("out"));
+    let root = root_by_dir(&report, ".");
+    assert_eq!(
+        root["status"], "Indexed",
+        "a best-effort compile failure must still salvage indexing: {root:#}"
+    );
+    let notes: Vec<&str> = root["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        notes.iter().any(|n| n.contains("meson-compile")),
+        "notes: {notes:?}"
+    );
+
+    let repo_canon = fs::canonicalize(repo.path()).unwrap();
+    let build_dir = clang_env_build_dir(home.path(), repo.path());
+    let invocations = read_argv_records(&records);
+    assert_eq!(
+        invocations,
+        vec![
+            vec![
+                "setup".to_string(),
+                build_dir.display().to_string(),
+                repo_canon.display().to_string(),
+            ],
+            vec![
+                "compile".to_string(),
+                "-C".to_string(),
+                build_dir.display().to_string(),
+            ],
+        ],
+        "meson invocations: {invocations:#?}"
+    );
+}
+
+// 9. Make/Autotools gate: default-off degrades with the exact reason;
+// allow_make=true + a fake bear runs the bear-make step and surfaces
+// repo_writes; bear missing degrades with its own exact reason.
+#[test]
+fn m7_case4_make_gate_default_off_allow_make_and_bear_missing() {
+    // -- default (allow_make unset) -> degrade with the exact reason. --
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let ws = tempdir().unwrap();
+    fs::write(repo.path().join("Makefile"), "all:\n\ttrue\n").unwrap();
+    write_scip_clang_pin(repo.path(), "\"--scip-doc\", \"main.c\"");
+
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .env("PATH", "/bin:/usr/bin")
+        .args(["index"])
+        .arg(repo.path())
+        .arg("--workspace")
+        .arg(ws.path())
+        .assert()
+        .code(4);
+    let report = read_report(&ws.path().join("out"));
+    let root = root_by_dir(&report, ".");
+    assert_eq!(root["status"], "Degraded", "root: {root:#}");
+    assert_eq!(
+        root["reason"].as_str().unwrap(),
+        "no compile_commands.json; make-based generation requires families.clang.allow_make = true"
+    );
+
+    // -- allow_make = true, bear missing -> its own exact degrade reason. --
+    let home2 = tempdir().unwrap();
+    let repo2 = tempdir().unwrap();
+    let ws2 = tempdir().unwrap();
+    fs::write(repo2.path().join("Makefile"), "all:\n\ttrue\n").unwrap();
+    let fake = fake_indexer();
+    let fake = fake.to_str().unwrap();
+    fs::write(
+        repo2.path().join(".tamga.toml"),
+        format!("[indexers.scip-clang]\npath = \"{fake}\"\n[families.clang]\nallow_make = true\n"),
+    )
+    .unwrap();
+    tamga()
+        .env("TAMGA_HOME", home2.path())
+        .env("PATH", "/bin:/usr/bin")
+        .args(["index"])
+        .arg(repo2.path())
+        .arg("--workspace")
+        .arg(ws2.path())
+        .assert()
+        .code(4);
+    let report2 = read_report(&ws2.path().join("out"));
+    let root2 = root_by_dir(&report2, ".");
+    assert_eq!(root2["status"], "Degraded", "root: {root2:#}");
+    assert_eq!(
+        root2["reason"].as_str().unwrap(),
+        "bear required for make-based compdb generation"
+    );
+
+    // -- allow_make = true + a fake bear -> the bear-make step runs and
+    //    repo_writes surfaces the make-wrote-into-the-repo note. --
+    let home3 = tempdir().unwrap();
+    let repo3 = tempdir().unwrap();
+    let ws3 = tempdir().unwrap();
+    let path_dir = tempdir().unwrap();
+    let records = home3.path().join("bear-records.txt");
+    write_fake_bear(path_dir.path(), &records);
+    fs::write(repo3.path().join("Makefile"), "all:\n\ttrue\n").unwrap();
+    fs::write(
+        repo3.path().join("main.c"),
+        "int main(void) { return 0; }\n",
+    )
+    .unwrap();
+    let fake3 = fake_indexer();
+    let fake3 = fake3.to_str().unwrap();
+    fs::write(
+        repo3.path().join(".tamga.toml"),
+        format!(
+            "[indexers.scip-clang]\npath = \"{fake3}\"\nargs = [\"--scip-doc\", \"main.c\"]\n\
+             [families.clang]\nallow_make = true\n"
+        ),
+    )
+    .unwrap();
+
+    tamga()
+        .env("TAMGA_HOME", home3.path())
+        .env("PATH", scratch_path(path_dir.path()))
+        .args(["index"])
+        .arg(repo3.path())
+        .arg("--workspace")
+        .arg(ws3.path())
+        .assert()
+        .code(0);
+
+    let report3 = read_report(&ws3.path().join("out"));
+    let root3 = root_by_dir(&report3, ".");
+    assert_eq!(root3["status"], "Indexed", "root: {root3:#}");
+    assert!(has_step(root3, "bear-make"), "root: {root3:#}");
+    let writes: Vec<&str> = root3["repo_writes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        writes,
+        vec!["make wrote build artifacts into the repo (bear strategy)"]
+    );
+
+    let repo3_canon = fs::canonicalize(repo3.path()).unwrap();
+    let build_dir = clang_env_build_dir(home3.path(), repo3.path());
+    let invocations = read_argv_records(&records);
+    assert_eq!(
+        invocations,
+        vec![vec![
+            "--output".to_string(),
+            build_dir
+                .join("compile_commands.json")
+                .display()
+                .to_string(),
+            "--".to_string(),
+            "make".to_string(),
+            "-C".to_string(),
+            repo3_canon.display().to_string(),
+        ]],
+        "bear invocation: {invocations:#?}"
+    );
+}
+
+// Autotools: `./configure` runs before bear-make, and its repo write is
+// surfaced too.
+#[test]
+fn m7_case4b_autotools_runs_configure_before_bear_make_with_repo_writes() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let ws = tempdir().unwrap();
+    let path_dir = tempdir().unwrap();
+    let records = home.path().join("bear-records.txt");
+    write_fake_bear(path_dir.path(), &records);
+    fs::write(repo.path().join("configure.ac"), "AC_INIT([app],[1.0])\n").unwrap();
+    fs::write(repo.path().join("main.c"), "int main(void) { return 0; }\n").unwrap();
+    // A real, direct-executed `./configure` script (autotools convention:
+    // it lives in the repo, not on PATH).
+    write_executable(
+        &repo.path().join("configure"),
+        b"#!/bin/sh\necho configured > .configure-ran\nexit 0\n",
+    );
+    let fake = fake_indexer();
+    let fake = fake.to_str().unwrap();
+    fs::write(
+        repo.path().join(".tamga.toml"),
+        format!(
+            "[indexers.scip-clang]\npath = \"{fake}\"\nargs = [\"--scip-doc\", \"main.c\"]\n\
+             [families.clang]\nallow_make = true\n"
+        ),
+    )
+    .unwrap();
+
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .env("PATH", scratch_path(path_dir.path()))
+        .args(["index"])
+        .arg(repo.path())
+        .arg("--workspace")
+        .arg(ws.path())
+        .assert()
+        .code(0);
+
+    let report = read_report(&ws.path().join("out"));
+    let root = root_by_dir(&report, ".");
+    assert_eq!(root["status"], "Indexed", "root: {root:#}");
+    assert!(has_step(root, "autotools-configure"));
+    assert!(has_step(root, "bear-make"));
+    assert!(
+        repo.path().join(".configure-ran").is_file(),
+        "the real ./configure script must actually have run"
+    );
+    let writes: Vec<&str> = root["repo_writes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        writes.contains(&"./configure wrote build files into the repo (config.status etc.)"),
+        "repo_writes: {writes:?}"
+    );
+    assert!(
+        writes.contains(&"make wrote build artifacts into the repo (bear strategy)"),
+        "repo_writes: {writes:?}"
+    );
+}
+
+// 10. cmake missing degrades with the exact reason, and the persistent
+// `<env>/build` dir is reused byte-for-byte (same absolute path) across two
+// independent `tamga index` runs against the same repo.
+#[test]
+fn m7_case5_cmake_missing_degrades_with_exact_reason() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let ws = tempdir().unwrap();
+    fs::write(repo.path().join("CMakeLists.txt"), "project(app c)\n").unwrap();
+    write_scip_clang_pin(repo.path(), "\"--scip-doc\", \"main.c\"");
+
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .env("PATH", "/bin:/usr/bin") // no cmake on it
+        .args(["index"])
+        .arg(repo.path())
+        .arg("--workspace")
+        .arg(ws.path())
+        .assert()
+        .code(4);
+
+    let report = read_report(&ws.path().join("out"));
+    let root = root_by_dir(&report, ".");
+    assert_eq!(root["status"], "Degraded", "root: {root:#}");
+    assert_eq!(
+        root["reason"].as_str().unwrap(),
+        "cmake required for CMake compdb generation"
+    );
+}
+
+#[test]
+fn m7_case5b_cmake_build_dir_persists_across_two_runs() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let path_dir = tempdir().unwrap();
+    let records = home.path().join("cmake-records.txt");
+    write_fake_cmake(path_dir.path(), &records);
+    fs::write(repo.path().join("CMakeLists.txt"), "project(app c)\n").unwrap();
+    fs::write(repo.path().join("main.c"), "int main(void) { return 0; }\n").unwrap();
+    write_scip_clang_pin(repo.path(), "\"--scip-doc\", \"main.c\"");
+
+    for _ in 0..2 {
+        let out = tempdir().unwrap();
+        tamga()
+            .env("TAMGA_HOME", home.path())
+            .env("PATH", scratch_path(path_dir.path()))
+            .args(["index"])
+            .arg(repo.path())
+            .args(["--output"])
+            .arg(out.path())
+            .assert()
+            .code(0);
+    }
+
+    let build_dir = clang_env_build_dir(home.path(), repo.path());
+    let invocations = read_argv_records(&records);
+    assert_eq!(
+        invocations.len(),
+        4,
+        "2 runs x (configure + build): {invocations:#?}"
+    );
+    // Every single invocation's -B/--build target is the exact same
+    // absolute path: the env-cache dir (keyed by the unchanged
+    // CMakeLists.txt's manifest hash) never moved between the two runs.
+    for argv in &invocations {
+        assert!(
+            argv.iter().any(|a| a == &build_dir.display().to_string()),
+            "expected {} in {argv:?}",
+            build_dir.display()
+        );
+    }
+    assert!(
+        build_dir.join("compile_commands.json").is_file(),
+        "the persistent build dir should still hold the compdb after both runs"
+    );
+}
+
+// Live (gated): real cmake + real scip-clang against a tiny 2-file CMake
+// fixture with a cross-file call (main.c calls util.c's `add`). Self-skips
+// unless both `cmake` and `scip-clang` are actually on PATH. Runs twice
+// against the SAME TAMGA_HOME/repo to prove the second run is incremental
+// (cmake's own configure+build become no-ops against the already-built
+// `<env>/build`, and the compdb keeps producing an index) -- no timing
+// assertion, just that both runs succeed and produce a real index.
+#[test]
+#[ignore = "requires real cmake + scip-clang and TAMGA_LIVE=1"]
+fn live_scip_clang_indexes_a_tiny_cmake_fixture_incrementally() {
+    if std::env::var("TAMGA_LIVE").is_err() {
+        eprintln!("skipping live test: set TAMGA_LIVE=1 to enable");
+        return;
+    }
+    if tamga::indexers::find_on_path("cmake").is_none() {
+        eprintln!("skipping live test: cmake not on PATH");
+        return;
+    }
+    if tamga::indexers::find_on_path("scip-clang").is_none() {
+        eprintln!("skipping live test: scip-clang not on PATH");
+        return;
+    }
+
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    fs::write(
+        repo.path().join("CMakeLists.txt"),
+        "cmake_minimum_required(VERSION 3.10)\n\
+         project(tinyclang C)\n\
+         add_executable(tinyclang main.c util.c)\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join("util.c"),
+        "int add(int a, int b) {\n    return a + b;\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join("main.c"),
+        "int add(int a, int b);\nint main(void) {\n    return add(1, 2);\n}\n",
+    )
+    .unwrap();
+
+    for run in 1..=2 {
+        let out = tempdir().unwrap();
+        let assert = tamga()
+            .env("TAMGA_HOME", home.path())
+            .args(["index"])
+            .arg(repo.path())
+            .args(["--output"])
+            .arg(out.path())
+            .assert();
+        let code = assert.get_output().status.code().unwrap_or(-1);
+        assert_eq!(
+            code, 0,
+            "run {run}: expected a clean index, got exit {code}"
+        );
+
+        let index = read_index(&out.path().join("index.scip"));
+        let paths = doc_paths(&index);
+        assert!(
+            paths.iter().any(|p| p.contains("main.c")),
+            "run {run}: expected a main.c document, got: {paths:?}"
+        );
+    }
+}

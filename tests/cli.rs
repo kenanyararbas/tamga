@@ -273,7 +273,7 @@ fn indexers_list_json_reports_pinned_versions_for_missing_indexers() {
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let entries = json.as_array().unwrap();
-    assert_eq!(entries.len(), 8);
+    assert_eq!(entries.len(), 9);
     let go = entries
         .iter()
         .find(|e| e["id"] == "scip-go")
