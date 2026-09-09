@@ -20,7 +20,18 @@
 //!   into its current directory. The index step's argv wraps the real
 //!   invocation in a small POSIX shell script that runs it with cwd=root
 //!   and then moves the file out to the real per-root output path,
-//!   preserving the wrapped command's own exit code either way.
+//!   preserving the wrapped command's own exit code either way. The
+//!   wrapper `rm -f index.scip`s *before* running scip-php, so a leftover
+//!   from an earlier run (or an unrelated file that happens to share that
+//!   exact name) can't be mistaken for fresh output. Deliberately not a
+//!   full backup/restore guard (unlike .NET's `global.json`): `index.scip`
+//!   at a repo root is, in every real project this family targets, either
+//!   absent or itself a previous SCIP build artifact (typically
+//!   gitignored) -- a bigger safety net for a name this family owns by
+//!   convention was judged disproportionate. Instead, `pipeline.rs`
+//!   checks for a pre-existing `index.scip` before the run starts and, if
+//!   one was there, records an honest `RootReport::repo_writes` note that
+//!   it was deleted -- the "at minimum" option, not silent.
 
 use std::ffi::OsString;
 use std::path::Path;

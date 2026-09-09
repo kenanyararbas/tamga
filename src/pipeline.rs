@@ -41,6 +41,17 @@ struct RunnablePlan {
     /// Slots this root's task consumes from the pool's `jobs` budget
     /// (`Family::weight`).
     weight: u32,
+    /// `true` iff this is a PHP root and a `index.scip` file already sat
+    /// at its repo root *before* this run -- PHP's index-step wrapper
+    /// unconditionally `rm -f index.scip`s there before invoking scip-php
+    /// (see `families::php`'s `INDEX_WRAPPER_SCRIPT`), so a leftover,
+    /// non-tamga file with that exact name gets silently destroyed. Full
+    /// backup/restore (mirroring .NET's `global.json` guard) was judged
+    /// disproportionate for a plausibly-gitignored build artifact; this
+    /// flag is the "at minimum" option the ledger allowed: an honest
+    /// `repo_writes` note recorded in `build_root_report` whenever the
+    /// index step actually ran (i.e. actually reached the `rm -f`).
+    php_index_scip_preexisted: bool,
 }
 
 /// Entry point for `tamga index`. Returns the process exit code.
@@ -194,6 +205,15 @@ pub fn run_index(args: &IndexArgs) -> i32 {
             continue;
         }
 
+        // Checked before any step runs: PHP's index-step wrapper deletes
+        // any `index.scip` sitting at the repo root before invoking
+        // scip-php, so this is the only point where "did one already
+        // exist" is still observable.
+        let php_index_scip_preexisted = family_id == FamilyId::Php
+            && families::abs_root_dir(&repo_abs, &root.candidate.dir)
+                .join("index.scip")
+                .is_file();
+
         let mut steps = family.prepare(&root, &ctx);
         let mut index_step = family.index_step(&root, &out_path, &ctx);
         // Append any config-provided extra indexer args to the index step.
@@ -210,6 +230,7 @@ pub fn run_index(args: &IndexArgs) -> i32 {
             out_path,
             steps,
             weight: family.weight(),
+            php_index_scip_preexisted,
         });
     }
 
@@ -321,6 +342,21 @@ fn build_root_report(
         report
             .repo_writes
             .push("composer install created/updated vendor/".to_string());
+    }
+
+    // PHP's index-step wrapper unconditionally `rm -f index.scip`s at the
+    // repo root before invoking scip-php (it always writes there with no
+    // output-path flag of its own). If a file by that exact name already
+    // sat there before this run -- some unrelated, non-tamga artifact --
+    // it just got destroyed. Surfaced honestly whenever the index step
+    // actually started (the `rm -f` is its first statement, so it already
+    // ran by then regardless of how the step itself later finished).
+    if plan.php_index_scip_preexisted && result.steps.iter().any(|(id, _)| id == INDEX_STEP_ID) {
+        report.repo_writes.push(
+            "a pre-existing index.scip at the repo root was deleted before indexing \
+             (not written by tamga)"
+                .to_string(),
+        );
     }
 
     // .NET's `dotnet restore` writes build intermediates (obj/) directly

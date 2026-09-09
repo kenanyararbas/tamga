@@ -1087,6 +1087,66 @@ fn m5_case10_php_move_wrap_behavior() {
     );
 }
 
+// PHP: a pre-existing (non-tamga) `index.scip` sitting at the repo root
+// gets deleted by the wrapper's `rm -f` before scip-php ever runs -- that
+// destructive side effect must be disclosed as a repo_writes note, not
+// silent.
+#[test]
+fn m8_php_preexisting_index_scip_is_disclosed_as_a_repo_write() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let out = tempdir().unwrap();
+    fs::write(
+        repo.path().join("composer.json"),
+        "{\"name\": \"acme/app\"}\n",
+    )
+    .unwrap();
+    fs::write(repo.path().join("app.php"), "<?php\n").unwrap();
+    // A stray file that happens to share scip-php's hardcoded output name
+    // -- not written by tamga, e.g. left over from a manual run.
+    fs::write(repo.path().join("index.scip"), b"stale, unrelated bytes").unwrap();
+
+    let fake = fake_indexer();
+    let fake = fake.to_str().unwrap();
+    fs::write(
+        repo.path().join(".tamga.toml"),
+        format!(
+            "[indexers.scip-php]\npath = \"{fake}\"\nargs = [\"--output\", \"index.scip\", \"--scip-doc\", \"app.php\"]\n"
+        ),
+    )
+    .unwrap();
+
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .args(["index"])
+        .arg(repo.path())
+        .args(["--no-install", "--output"])
+        .arg(out.path())
+        .assert()
+        .code(0);
+
+    let report = read_report(out.path());
+    let root = root_by_dir(&report, ".");
+    let writes: Vec<&str> = root["repo_writes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        writes
+            .iter()
+            .any(|w| w.contains("index.scip") && w.contains("deleted")),
+        "repo_writes: {writes:?}"
+    );
+
+    // The stale file is gone (the wrapper's own fresh index.scip was moved
+    // out to `out`, not left behind).
+    assert!(!repo.path().join("index.scip").exists());
+    let index = read_index(&out.path().join("index.scip"));
+    assert_eq!(doc_paths(&index), vec!["app.php".to_string()]);
+}
+
 // ---- M6: JVM + .NET pipeline integration -------------------------------
 
 /// Write a fake `dotnet` onto `dir` that answers `--version` and no-ops
