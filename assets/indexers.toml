@@ -1,0 +1,50 @@
+# Embedded via `include_str!` in `src/indexers/manifest.rs`: pinned
+# versions and (for direct binary downloads) sha256 checksums for the SCIP
+# indexers tamga knows how to acquire into its managed `tools/` cache.
+#
+# Provenance, verified 2026-09-09 (see task-5-report.md for the full
+# research trail):
+#
+# - scip-go: sourcegraph/scip-go release v0.2.7. Checksums are the sha256
+#   GitHub itself reports for each asset (Releases API `digest` field);
+#   independently re-verified by downloading each asset and hashing it
+#   locally (`shasum -a 256`). Note: the sourcegraph/scip-go repository has
+#   since been transferred to the `scip-code` org; GitHub 301/302-redirects
+#   the old `sourcegraph/scip-go` release download URLs to
+#   `scip-code/scip-go`, confirmed working end-to-end, so `repo` below is
+#   left as `sourcegraph/scip-go`. Only 3 targets ship prebuilt binaries
+#   (no x86_64-apple-darwin, no Windows) -- unlisted targets are a resolve-
+#   time "no prebuilt binary for this platform" error, not a manifest
+#   error.
+# - scip-typescript / scip-python: published to npm under the @sourcegraph
+#   scope. Versions are each package's current "latest" dist-tag per the
+#   npm registry API. npm's own package-integrity check (documented in
+#   acquire.rs) is the trust boundary for these -- no separate sha256 is
+#   tracked here.
+
+[scip-go]
+version = "0.2.7"
+dist = "github-release"
+repo = "sourcegraph/scip-go"
+
+[scip-go.targets.aarch64-apple-darwin]
+asset = "scip-go-darwin-arm64.tar.gz"
+sha256 = "f21b505452a8dbb270c18ec66690e583801f9e96cff1d72e84c004b7374ec672"
+
+[scip-go.targets.x86_64-unknown-linux-gnu]
+asset = "scip-go-linux-amd64.tar.gz"
+sha256 = "5bfe39016ca04f5b3b1cce41d1b63ea120a7d7e93b55407bfb17a6b02d18135a"
+
+[scip-go.targets.aarch64-unknown-linux-gnu]
+asset = "scip-go-linux-arm64.tar.gz"
+sha256 = "6b93476c7578c5aeb5acacb41f8234c20130168271adea0db8d8ae63d1355acb"
+
+[scip-typescript]
+version = "0.4.0"
+dist = "npm"
+package = "@sourcegraph/scip-typescript"
+
+[scip-python]
+version = "0.6.6"
+dist = "npm"
+package = "@sourcegraph/scip-python"

@@ -8,6 +8,9 @@
 //! `--version` is probed best-effort for the report; a failure to probe is
 //! never fatal (the binary still resolves).
 
+pub mod acquire;
+pub mod manifest;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -104,7 +107,7 @@ pub fn find_on_path(bin: &str) -> Option<PathBuf> {
 }
 
 #[cfg(unix)]
-fn is_executable_file(path: &Path) -> bool {
+pub(crate) fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(path) {
         Ok(meta) => meta.is_file() && meta.permissions().mode() & 0o111 != 0,
@@ -113,7 +116,7 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_executable_file(path: &Path) -> bool {
+pub(crate) fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 
