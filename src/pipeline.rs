@@ -336,6 +336,30 @@ fn build_root_report(
             .push("dotnet restore wrote build intermediates (obj/) into the repo".to_string());
     }
 
+    // Clang's Make/Autotools (bear) strategy shells out to the target's own
+    // `./configure` and `make -C <root>`, both of which write directly into
+    // the repo tree (config.status etc., then object files/build
+    // artifacts) -- the plan-sanctioned permanent repo write for this
+    // strategy. Surface each whenever its step actually ran.
+    if result
+        .steps
+        .iter()
+        .any(|(id, _)| id == prepare::compdb::AUTOTOOLS_CONFIGURE_STEP_ID)
+    {
+        report
+            .repo_writes
+            .push("./configure wrote build files into the repo (config.status etc.)".to_string());
+    }
+    if result
+        .steps
+        .iter()
+        .any(|(id, _)| id == prepare::compdb::BEAR_MAKE_STEP_ID)
+    {
+        report
+            .repo_writes
+            .push("make wrote build artifacts into the repo (bear strategy)".to_string());
+    }
+
     // Cancellation wins outright.
     if result.cancelled_before_start
         || result

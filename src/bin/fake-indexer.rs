@@ -18,10 +18,15 @@
 //!   --spawn-child        spawn a long-sleeping grandchild in the SAME
 //!                        process group, to let tests prove group-kill
 //!                        reaps it too
-//!   --output <path>      write the SCIP index here (this is the flag the
+//!   --output <path>      write the SCIP index here (this is the flag most
 //!                        real indexers use, so the pipeline drives it)
 //!   --write-scip <path>  synonym for --output (takes precedence if both
 //!                        are given); kept for the exec-layer tests
+//!   --index-output-path <path>
+//!                        another synonym for --output, matching
+//!                        scip-clang's real flag name (lowest precedence
+//!                        of the three: --write-scip, then --output, then
+//!                        this)
 //!   --scip-doc <rel>     add one document at this relative path with a
 //!                        single dummy occurrence (repeatable). Zero of
 //!                        these plus an output path writes a valid but
@@ -48,6 +53,7 @@ fn main() {
     let mut spawn_child = false;
     let mut output: Option<String> = None;
     let mut write_scip: Option<String> = None;
+    let mut index_output_path: Option<String> = None;
     let mut scip_docs: Vec<String> = Vec::new();
     let mut corrupt = false;
 
@@ -70,6 +76,10 @@ fn main() {
             "--write-scip" => {
                 i += 1;
                 write_scip = args.get(i).cloned();
+            }
+            "--index-output-path" => {
+                i += 1;
+                index_output_path = args.get(i).cloned();
             }
             "--scip-doc" => {
                 i += 1;
@@ -99,9 +109,10 @@ fn main() {
 
     record(&args, child_pid);
 
-    // `--write-scip` wins over `--output` when both are present so the
-    // exec-layer tests (which use --write-scip) stay unambiguous.
-    if let Some(path) = write_scip.or(output) {
+    // `--write-scip` wins over `--output` wins over `--index-output-path`
+    // when more than one is present, so the exec-layer tests (which use
+    // --write-scip) stay unambiguous.
+    if let Some(path) = write_scip.or(output).or(index_output_path) {
         if corrupt {
             let _ = std::fs::write(&path, b"\x00\x01 not a valid scip index \xff\xfe");
         } else {

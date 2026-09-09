@@ -77,6 +77,17 @@ pub trait Fetcher: Sync {
     fn fetch(&self, url: &str) -> Result<Vec<u8>, AcquireError>;
 }
 
+/// ureq's own `Body::read_to_vec()` silently caps a response at 10MB
+/// unless told otherwise (`ureq::body::Body`'s documented default). Every
+/// indexer binary this crate has downloaded until now happened to fit
+/// under that cap, but scip-clang's release assets are bare, uncompressed
+/// binaries (macOS arm64 ~71MB, Linux x86_64 ~149MB) that blow right
+/// through it -- a real download otherwise fails outright with ureq's own
+/// "response body is larger than request limit" error before checksum
+/// verification even gets a chance to run. 256MB comfortably covers every
+/// asset in `assets/indexers.toml` today with headroom for future ones.
+const MAX_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
+
 /// The real fetcher: a plain `ureq` GET with a whole-request timeout.
 /// ureq's default TLS backend is rustls (the brief's "ureq (rustls TLS)").
 pub struct UreqFetcher;
@@ -93,6 +104,8 @@ impl Fetcher for UreqFetcher {
             .map_err(|e| AcquireError::Download(format!("{url}: {e}")))?;
         response
             .body_mut()
+            .with_config()
+            .limit(MAX_DOWNLOAD_BYTES)
             .read_to_vec()
             .map_err(|e| AcquireError::Download(format!("{url}: {e}")))
     }
