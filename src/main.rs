@@ -8,15 +8,16 @@
 //! explicitly below and exit 2. Anything else -- the "1 = internal
 //! error/panic" case -- propagates as an `anyhow::Error`; returning it
 //! from `main` prints it and exits 1, which is exactly that mapping.
-//! `detect`/`index`/`indexers`/`merge` are the one deliberate exception:
-//! the brief mandates they exit 1 as stubs regardless of this scheme.
+//! `index`/`indexers`/`merge` are still stubs that exit 1 until their
+//! milestones land; `detect` (M1) is implemented and uses its own mapping
+//! (0 = roots found, 5 = none, 2 = malformed config).
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Parser;
 
-use tamga::cli::{CleanArgs, Cli, Command, DoctorArgs, IndexersAction};
+use tamga::cli::{CleanArgs, Cli, Command, DetectArgs, DoctorArgs, IndexersAction};
 use tamga::config::{CliOverrides, TamgaConfig};
 use tamga::workspace::{CleanTarget, Workspace};
 
@@ -33,7 +34,7 @@ fn main() -> anyhow::Result<ExitCode> {
 
 fn dispatch(cli: Cli) -> i32 {
     match cli.command {
-        Command::Detect(_) => stub("detect"),
+        Command::Detect(args) => run_detect(args),
         Command::Index(_) => stub("index"),
         Command::Indexers { action } => match action {
             IndexersAction::List(_) => stub("indexers list"),
@@ -50,6 +51,28 @@ fn dispatch(cli: Cli) -> i32 {
 fn stub(name: &str) -> i32 {
     eprintln!("tamga {name}: not yet implemented");
     1
+}
+
+/// `detect` runs the M1 detection engine: load the effective config for
+/// the repo, walk + resolve roots, and print either a human tree or stable
+/// JSON. Exit 0 when at least one root is found, 5 when none, 2 on a
+/// malformed config. The JSON form is always complete; `--explain` only
+/// affects the human text output.
+fn run_detect(args: DetectArgs) -> i32 {
+    let repo = args.path.unwrap_or_else(|| PathBuf::from("."));
+    let (_workspace, config) = match load_config(Some(&repo)) {
+        Ok(pair) => pair,
+        Err(code) => return code,
+    };
+
+    let report = tamga::detect::detect(&repo, &config);
+    if args.json {
+        println!("{}", report.to_json());
+    } else {
+        println!("{}", report.to_human(args.explain));
+    }
+
+    if report.roots.is_empty() { 5 } else { 0 }
 }
 
 /// `doctor` is purely informational in M0: it never touches config or
