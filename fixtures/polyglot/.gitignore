@@ -1,0 +1,32 @@
+# Build-tool writes a live `tamga index` run leaves behind across the 9
+# family units in this fixture. Mirrors the walker's own built-in ignore
+# overlay (src/detect/walker.rs) plus a few tool-specific extras -- none of
+# this should ever be committed; a clean `git status` after a live run
+# proves tamga only made the writes it discloses in repo_writes.
+node_modules/
+dist/
+build/
+target/
+bin/
+obj/
+.venv/
+venv/
+__pycache__/
+*.egg-info/
+.gradle/
+.idea/
+.vs/
+Pods/
+.next/
+.turbo/
+coverage/
+cmake-build-*/
+vendor/
+.bundle/
+Gemfile.lock
+pnpm-lock.yaml
+package-lock.json
+composer.lock
+index.scip
+*.scip
+*.log

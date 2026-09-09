@@ -1093,3 +1093,68 @@ fn snapshot_npm_workspaces() {
     let report = run(repo.path());
     insta::assert_snapshot!("npm_workspaces", normalized_json(&report, &repo));
 }
+
+// ---- M8: committed fixtures/polyglot/ -----------------------------------
+
+/// `fixtures/polyglot/` at the crate root (a real, committed tree -- not a
+/// tempdir), one unit per family. This test is pure detection (no indexer
+/// or toolchain involved), so unlike `live_polyglot_index_available_subset`
+/// (tests/index.rs, `#[ignore]` + `TAMGA_LIVE=1`) it runs in the normal
+/// offline suite: `tamga detect` must find exactly the expected 9 roots
+/// regardless of what's installed on this machine.
+#[test]
+fn live_polyglot_detect_finds_exactly_nine_roots_with_workspaces_subsuming_members() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/polyglot");
+    let report = run(&repo);
+
+    let mut ids = ids(&report);
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![
+            "backend+python".to_string(),
+            "dotnetapp+dotnet+App".to_string(),
+            "frontend+jsts".to_string(),
+            "gosvc+go".to_string(),
+            "jvmapp+jvm".to_string(),
+            "native+clang".to_string(),
+            "phplib+php".to_string(),
+            "rubyapp+ruby".to_string(),
+            "rustlib+rust".to_string(),
+        ],
+        "fixtures/polyglot must mint exactly one root per family unit"
+    );
+
+    // The frontend pnpm workspace subsumes both member packages.
+    let frontend = find(&report, "frontend").unwrap();
+    assert_eq!(frontend.candidate.strength, RootStrength::Workspace);
+    assert_eq!(
+        subsumed_dirs(frontend),
+        vec![
+            "frontend/packages/pkg-a".to_string(),
+            "frontend/packages/pkg-b".to_string(),
+        ]
+    );
+
+    // The rustlib Cargo workspace subsumes both member crates.
+    let rustlib = find(&report, "rustlib").unwrap();
+    assert_eq!(rustlib.candidate.strength, RootStrength::Workspace);
+    assert_eq!(
+        subsumed_dirs(rustlib),
+        vec!["rustlib/crate-a".to_string(), "rustlib/crate-b".to_string(),]
+    );
+
+    // The dotnetapp solution subsumes its own project dir.
+    let dotnetapp = find(&report, "dotnetapp").unwrap();
+    assert_eq!(dotnetapp.candidate.strength, RootStrength::Workspace);
+    assert_eq!(subsumed_dirs(dotnetapp), vec!["dotnetapp/App".to_string()]);
+
+    // Every other unit is a plain, non-subsuming root.
+    for dir in ["backend", "gosvc", "jvmapp", "native", "phplib", "rubyapp"] {
+        let root = find(&report, dir).unwrap();
+        assert!(
+            root.subsumed.is_empty(),
+            "{dir} should not subsume anything: {root:?}"
+        );
+    }
+}
