@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::detect::evidence::Evidence;
@@ -254,6 +254,14 @@ pub fn matches_member_glob(patterns: &[String], rel: &Path) -> bool {
     }
 }
 
+/// Compiles `patterns` with `literal_separator(true)`: a single `*`/`?`
+/// stops at a `/` (so `crates/*` names only direct children of `crates/`,
+/// matching real Cargo/npm/pnpm/uv workspace-member semantics), while
+/// `**` still crosses directory boundaries (so pnpm's `packages/**`, or
+/// any other explicitly-recursive glob, keeps matching arbitrarily-nested
+/// descendants). Without this, `Glob::new`'s default (wildcards freely
+/// cross `/`) makes `crates/*` also match `crates/a/b`, silently
+/// subsuming crates real Cargo/npm/pnpm/uv would never treat as members.
 fn build_globset(patterns: &[String]) -> Option<GlobSet> {
     if patterns.is_empty() {
         return None;
@@ -261,7 +269,7 @@ fn build_globset(patterns: &[String]) -> Option<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     let mut any = false;
     for p in patterns {
-        if let Ok(glob) = Glob::new(p) {
+        if let Ok(glob) = GlobBuilder::new(p).literal_separator(true).build() {
             builder.add(glob);
             any = true;
         }
@@ -330,4 +338,54 @@ pub(crate) fn has_members(candidate: &RootCandidate) -> bool {
 /// Strength helpers kept here so families agree on ordering semantics.
 pub(crate) fn is_weak(candidate: &RootCandidate) -> bool {
     candidate.strength == RootStrength::Weak
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `*` is a single-path-segment wildcard, matching real Cargo/npm/
+    /// pnpm/uv workspace-member semantics: `crates/*` names direct
+    /// children of `crates/`, not arbitrarily-nested descendants. This is
+    /// shared code every glob-based family (Python's uv workspaces,
+    /// JS/TS's npm/pnpm workspaces, Rust's Cargo workspaces) funnels
+    /// through, so a wrong answer here silently mis-subsumes for all of
+    /// them.
+    #[test]
+    fn star_matches_only_a_direct_child_not_a_grandchild() {
+        let patterns = vec!["crates/*".to_string()];
+        assert!(matches_member_glob(&patterns, Path::new("crates/a")));
+        assert!(!matches_member_glob(&patterns, Path::new("crates/a/b")));
+    }
+
+    /// `**` still recurses arbitrarily deep -- pnpm's common
+    /// `packages/**` (or any multi-level workspace glob) must keep working
+    /// after the single-`*` fix.
+    #[test]
+    fn double_star_still_matches_arbitrarily_nested_descendants() {
+        let patterns = vec!["packages/**".to_string()];
+        assert!(matches_member_glob(&patterns, Path::new("packages/a")));
+        assert!(matches_member_glob(&patterns, Path::new("packages/a/b")));
+        assert!(matches_member_glob(&patterns, Path::new("packages/a/b/c")));
+    }
+
+    #[test]
+    fn star_at_top_level_matches_only_one_segment() {
+        let patterns = vec!["*".to_string()];
+        assert!(matches_member_glob(&patterns, Path::new("a")));
+        assert!(!matches_member_glob(&patterns, Path::new("a/b")));
+    }
+
+    #[test]
+    fn no_patterns_never_matches() {
+        assert!(!matches_member_glob(&[], Path::new("crates/a")));
+    }
+
+    #[test]
+    fn invalid_glob_is_skipped_not_fatal() {
+        // An unbalanced bracket is an invalid glob; matches_member_glob
+        // must not panic, and must simply not match through it.
+        let patterns = vec!["crates/[".to_string()];
+        assert!(!matches_member_glob(&patterns, Path::new("crates/a")));
+    }
 }
