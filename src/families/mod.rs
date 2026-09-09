@@ -23,8 +23,10 @@ use crate::exec::ExecStep;
 use crate::indexers::IndexerId;
 use crate::prepare::PrepareCtx;
 
+pub mod dotnet;
 pub mod go;
 pub mod jsts;
+pub mod jvm;
 pub mod php;
 pub mod python;
 pub mod ruby;
@@ -97,6 +99,13 @@ pub enum MarkerKind {
     Gemfile,
     // PHP
     ComposerJson,
+    // JVM
+    SettingsGradle,
+    SettingsGradleKts,
+    BuildGradle,
+    BuildGradleKts,
+    PomXml,
+    BuildSbt,
 }
 
 /// A marker filename and the kind it denotes. Families expose these as a
@@ -127,6 +136,18 @@ pub enum PackageManager {
     Bun,
 }
 
+/// Which build tool drives a JVM root. scip-java auto-detects the real
+/// tool at index time, so this is report evidence (and steers nothing at
+/// invocation); Gradle is preferred when a dir carries both Gradle and
+/// Maven markers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JvmBuildTool {
+    Gradle,
+    Maven,
+    Sbt,
+}
+
 /// Family-specific metadata attached to a candidate. Serialized as an
 /// object tagged by `kind` so the JSON contract is uniform.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +174,16 @@ pub enum FamilyMeta {
         has_gemfile: bool,
     },
     Php,
+    Jvm {
+        /// The tool scip-java will drive (Gradle preferred on a mixed dir).
+        /// Report evidence only -- scip-java auto-detects at index time.
+        build_tool: JvmBuildTool,
+    },
+    Dotnet {
+        /// The `.sln`/`.csproj`/`.fsproj` path (repo-relative) passed to
+        /// scip-dotnet explicitly for this root.
+        target: std::path::PathBuf,
+    },
 }
 
 /// Detection behaviour for one family. M1 keeps the trait detection-only:
@@ -183,6 +214,17 @@ pub trait Family: Sync + Send {
     /// keeps the generic wording.
     fn subsume_reason(&self, ancestor: &RootCandidate, child: &RootCandidate) -> Option<String> {
         let _ = (ancestor, child);
+        None
+    }
+
+    /// An optional discriminator appended to a root's id to disambiguate
+    /// multiple accepted same-family roots that resolve to the *same* dir
+    /// -- e.g. two `.sln` files in one directory, each its own .NET root
+    /// (`<dir>+dotnet+SolutionA`, `<dir>+dotnet+SolutionB`). Default
+    /// `None`: the id stays `<dir>+<slug>`, unchanged for every family that
+    /// never puts two roots in one dir.
+    fn root_discriminator(&self, candidate: &RootCandidate) -> Option<String> {
+        let _ = candidate;
         None
     }
 
@@ -229,19 +271,48 @@ pub fn registry() -> Vec<Box<dyn Family>> {
         Box::new(rustlang::Rust),
         Box::new(ruby::Ruby),
         Box::new(php::Php),
+        Box::new(jvm::Jvm),
+        Box::new(dotnet::Dotnet),
     ]
 }
 
 /// Stable root id: sanitized repo-relative dir + `+` + family slug. The
 /// repo root (`""`) sanitizes to `root`; path separators become `-`.
 pub fn root_id(dir: &Path, family: FamilyId) -> String {
+    root_id_with(dir, family, None)
+}
+
+/// Like [`root_id`], but appends `+<disc>` when a family provides a
+/// discriminator (see [`Family::root_discriminator`]) to keep two
+/// same-family roots that share a dir distinct. `disc` is sanitized the
+/// same way the dir is (path separators and other awkward characters
+/// become `-`) so the id stays a safe single filename component.
+pub fn root_id_with(dir: &Path, family: FamilyId, disc: Option<&str>) -> String {
     let d = dir.to_string_lossy();
     let sanitized = if d.is_empty() {
         "root".to_string()
     } else {
         d.replace(['/', '\\'], "-")
     };
-    format!("{sanitized}+{}", family.slug())
+    let base = format!("{sanitized}+{}", family.slug());
+    match disc {
+        Some(disc) => format!("{base}+{}", sanitize_component(disc)),
+        None => base,
+    }
+}
+
+/// Reduce a string to a safe single path component: any character that
+/// isn't ASCII-alphanumeric, `.`, `_` or `-` becomes `-`.
+fn sanitize_component(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 /// Compile workspace member globs and test whether `rel` (a child dir made

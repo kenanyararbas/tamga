@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use tamga::config::{ScanConfig, TamgaConfig};
 use tamga::detect::{DetectionReport, ResolvedRoot, RootStrength, detect};
-use tamga::families::{FamilyId, FamilyMeta, PackageManager, TsMode};
+use tamga::families::{FamilyId, FamilyMeta, JvmBuildTool, PackageManager, TsMode};
 use tempfile::{TempDir, tempdir};
 
 // ---- fixture helpers -------------------------------------------------
@@ -685,6 +685,204 @@ fn m5_case6_broken_cargo_toml_degrades_with_parse_error() {
             .any(|e| e.note.starts_with("parse-error:")),
         "broken Cargo.toml should leave a parse-error note"
     );
+}
+
+// ---- M6: JVM, .NET families -------------------------------------------
+
+// M6 case 1: settings.gradle root + nested build.gradle subdirs -> 1
+// Gradle workspace root subsuming all the gradle subprojects.
+#[test]
+fn m6_case1_settings_gradle_subsumes_nested_gradle() {
+    let repo = tempdir().unwrap();
+    write(repo.path(), "settings.gradle", "rootProject.name = 'app'\n");
+    write(repo.path(), "build.gradle", "plugins {}\n");
+    write(repo.path(), "a/build.gradle", "plugins {}\n");
+    write(repo.path(), "b/build.gradle.kts", "plugins {}\n");
+
+    let report = run(repo.path());
+    assert_eq!(ids(&report), vec!["root+jvm"]);
+    let root = find(&report, "").unwrap();
+    assert_eq!(root.candidate.family, FamilyId::Jvm);
+    assert_eq!(root.candidate.strength, RootStrength::Workspace);
+    assert_eq!(
+        root.candidate.meta,
+        FamilyMeta::Jvm {
+            build_tool: JvmBuildTool::Gradle
+        }
+    );
+    assert_eq!(subsumed_dirs(root), vec!["a".to_string(), "b".to_string()]);
+}
+
+// M6 case 2: topmost pom subsumes nested poms (Maven reactor); a sibling
+// pom tree stays independent.
+#[test]
+fn m6_case2_topmost_pom_subsumes_nested_sibling_tree_independent() {
+    let repo = tempdir().unwrap();
+    write(repo.path(), "svca/pom.xml", "<project></project>\n");
+    write(repo.path(), "svca/mod/pom.xml", "<project></project>\n");
+    write(repo.path(), "svcb/pom.xml", "<project></project>\n");
+
+    let report = run(repo.path());
+    assert_eq!(ids(&report), vec!["svca+jvm", "svcb+jvm"]);
+
+    let svca = find(&report, "svca").unwrap();
+    assert_eq!(
+        svca.candidate.meta,
+        FamilyMeta::Jvm {
+            build_tool: JvmBuildTool::Maven
+        }
+    );
+    assert_eq!(subsumed_dirs(svca), vec!["svca/mod".to_string()]);
+    assert!(find(&report, "svcb").unwrap().subsumed.is_empty());
+}
+
+// M6 case 3: build.sbt with a sibling project/ dir is a Workspace; nested
+// build.sbt is subsumed.
+#[test]
+fn m6_case3_build_sbt_with_project_dir_subsumes_nested_sbt() {
+    let repo = tempdir().unwrap();
+    write(repo.path(), "build.sbt", "name := \"app\"\n");
+    write(
+        repo.path(),
+        "project/build.properties",
+        "sbt.version=1.9.0\n",
+    );
+    write(repo.path(), "sub/build.sbt", "name := \"sub\"\n");
+
+    let report = run(repo.path());
+    assert_eq!(ids(&report), vec!["root+jvm"]);
+    let root = find(&report, "").unwrap();
+    assert_eq!(root.candidate.strength, RootStrength::Workspace);
+    assert_eq!(
+        root.candidate.meta,
+        FamilyMeta::Jvm {
+            build_tool: JvmBuildTool::Sbt
+        }
+    );
+    assert_eq!(subsumed_dirs(root), vec!["sub".to_string()]);
+}
+
+// M6 case 4: Gradle + Maven markers in the same dir -> one Gradle root
+// (build_tool=Gradle, both markers in evidence); a nested pom is subsumed
+// cross-tool under the settings.gradle workspace.
+#[test]
+fn m6_case4_gradle_maven_same_dir_one_root_cross_tool_subsume() {
+    let repo = tempdir().unwrap();
+    write(repo.path(), "settings.gradle", "rootProject.name='app'\n");
+    write(repo.path(), "build.gradle", "plugins {}\n");
+    write(repo.path(), "pom.xml", "<project></project>\n");
+    write(repo.path(), "mavenmod/pom.xml", "<project></project>\n");
+
+    let report = run(repo.path());
+    assert_eq!(ids(&report), vec!["root+jvm"]);
+    let root = find(&report, "").unwrap();
+    assert_eq!(root.candidate.strength, RootStrength::Workspace);
+    assert_eq!(
+        root.candidate.meta,
+        FamilyMeta::Jvm {
+            build_tool: JvmBuildTool::Gradle
+        }
+    );
+    // Both Gradle and Maven markers recorded in evidence.
+    let markers: Vec<String> = root
+        .candidate
+        .evidence
+        .iter()
+        .filter_map(|e| e.marker.as_ref().map(|m| m.to_string_lossy().into_owned()))
+        .collect();
+    assert!(
+        markers.contains(&"settings.gradle".to_string()),
+        "{markers:?}"
+    );
+    assert!(markers.contains(&"build.gradle".to_string()), "{markers:?}");
+    assert!(markers.contains(&"pom.xml".to_string()), "{markers:?}");
+    // The nested Maven module is folded into the Gradle build root.
+    assert_eq!(subsumed_dirs(root), vec!["mavenmod".to_string()]);
+    let reason = &root.subsumed[0].1;
+    assert!(
+        reason.contains("Maven module folded into the Gradle build root"),
+        "reason: {reason}"
+    );
+}
+
+// M6 case 5: shallowest sln subsumes a csproj beneath; two slns in one dir
+// are two roots with distinct meta.target; an orphan csproj is its own
+// root; global.json mints no root but is evidence on the .NET root.
+#[test]
+fn m6_case5_dotnet_sln_subsumption_multi_sln_orphan_and_global_json() {
+    let repo = tempdir().unwrap();
+    write(
+        repo.path(),
+        "web/App.sln",
+        "Microsoft Visual Studio Solution File\n",
+    );
+    write(
+        repo.path(),
+        "web/global.json",
+        "{\"sdk\":{\"version\":\"8.0.100\"}}\n",
+    );
+    write(
+        repo.path(),
+        "web/src/Core/Core.csproj",
+        "<Project></Project>\n",
+    );
+    write(repo.path(), "multi/One.sln", "solution one\n");
+    write(repo.path(), "multi/Two.sln", "solution two\n");
+    write(repo.path(), "orphan/Tool.csproj", "<Project></Project>\n");
+
+    let report = run(repo.path());
+    assert_eq!(
+        ids(&report),
+        vec![
+            "multi+dotnet+One",
+            "multi+dotnet+Two",
+            "orphan+dotnet+Tool",
+            "web+dotnet+App",
+        ]
+    );
+
+    // web: workspace sln subsuming the nested csproj, with global.json
+    // surfaced as evidence and the solution path as meta.target.
+    let web = find(&report, "web").unwrap();
+    assert_eq!(web.candidate.family, FamilyId::Dotnet);
+    assert_eq!(web.candidate.strength, RootStrength::Workspace);
+    assert_eq!(
+        web.candidate.meta,
+        FamilyMeta::Dotnet {
+            target: PathBuf::from("web/App.sln")
+        }
+    );
+    assert_eq!(subsumed_dirs(web), vec!["web/src/Core".to_string()]);
+    assert!(
+        web.candidate
+            .evidence
+            .iter()
+            .any(|e| e.marker.as_deref() == Some(Path::new("web/global.json"))),
+        "global.json should be evidence on the .NET root"
+    );
+
+    // multi: two roots, distinct targets, neither subsuming the other.
+    let targets: Vec<String> = report
+        .roots
+        .iter()
+        .filter(|r| r.candidate.dir == Path::new("multi"))
+        .map(|r| match &r.candidate.meta {
+            FamilyMeta::Dotnet { target } => target.to_string_lossy().into_owned(),
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(targets, vec!["multi/One.sln", "multi/Two.sln"]);
+
+    // orphan: a project with no sln above it is its own root.
+    let orphan = find(&report, "orphan").unwrap();
+    assert_eq!(orphan.candidate.strength, RootStrength::Project);
+    assert_eq!(
+        orphan.candidate.meta,
+        FamilyMeta::Dotnet {
+            target: PathBuf::from("orphan/Tool.csproj")
+        }
+    );
+    assert!(orphan.subsumed.is_empty());
 }
 
 // ---- snapshots -------------------------------------------------------

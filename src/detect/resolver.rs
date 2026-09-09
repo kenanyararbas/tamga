@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::detect::{ResolvedRoot, RootCandidate, RootStrength};
-use crate::families::{Family, FamilyId, root_id};
+use crate::families::{Family, FamilyId, root_id_with};
 
 /// Resolve candidates into the final, deterministically-ordered roots.
 pub fn resolve(
@@ -63,7 +63,8 @@ pub fn resolve(
                     accepted[i].subsumed.push((c.dir.clone(), reason));
                 }
                 None => {
-                    let id = root_id(&c.dir, c.family);
+                    let disc = family.root_discriminator(&c);
+                    let id = root_id_with(&c.dir, c.family, disc.as_deref());
                     accepted.push(ResolvedRoot {
                         id,
                         candidate: c,

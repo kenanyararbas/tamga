@@ -10,6 +10,9 @@
 //! so centralizing it keeps the trait to the three methods the pipeline
 //! actually dispatches through.
 
+pub mod dotnet_globaljson;
+pub mod jdk;
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -158,9 +161,58 @@ pub fn manifest_files(family: FamilyId, repo: &Path, root_dir: &Path) -> Vec<Pat
             .iter()
             .filter_map(|n| present(n))
             .collect(),
+        // JVM: the build manifests present at the root (any of Maven /
+        // Gradle / sbt), deterministic order.
+        FamilyId::Jvm => [
+            "pom.xml",
+            "settings.gradle",
+            "settings.gradle.kts",
+            "build.gradle",
+            "build.gradle.kts",
+            "gradle/libs.versions.toml",
+            "build.sbt",
+        ]
+        .iter()
+        .filter_map(|n| present(n))
+        .collect(),
+        // .NET: the solution/project files directly in the root dir, plus
+        // global.json and packages.lock.json when present. The specific
+        // target a root carries is one of these direct-child files; the
+        // root id (which includes the target stem) keeps two same-dir
+        // solutions' env caches distinct even when this set is identical.
+        FamilyId::Dotnet => {
+            let mut out = dotnet_target_files(repo, root_dir);
+            for name in ["global.json", "packages.lock.json"] {
+                if let Some(p) = present(name) {
+                    out.push(p);
+                }
+            }
+            out
+        }
         // Families without a build env yet: no manifest.
         _ => Vec::new(),
     }
+}
+
+/// `*.sln`/`*.slnx`/`*.csproj`/`*.fsproj` files directly inside
+/// `repo/root_dir` (non-recursive), sorted by path for a stable hash.
+fn dotnet_target_files(repo: &Path, root_dir: &Path) -> Vec<PathBuf> {
+    let dir = join_root(repo, root_dir, "");
+    let mut out: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && matches!(
+                    p.extension().and_then(|e| e.to_str()),
+                    Some("sln" | "slnx" | "csproj" | "fsproj")
+                )
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 /// `*.gemspec` files directly inside `repo/root_dir` (non-recursive),
