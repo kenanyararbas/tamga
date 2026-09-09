@@ -30,3 +30,12 @@ composer.lock
 index.scip
 *.scip
 *.log
+
+# frontend/tsconfig.json: a real `scip-typescript index --cwd frontend`
+# (live-verified, M8) writes a bare `{}` tsconfig.json at the scanned root
+# when none exists there -- true even with `ts_mode: Ts` (no
+# `--infer-tsconfig` flag involved), a scip-typescript behavior tamga
+# doesn't control or currently disclose via `repo_writes`. Ignored here so
+# a live run doesn't dirty the committed fixture; see task-9-report.md's
+# concerns section for the full writeup.
+frontend/tsconfig.json
