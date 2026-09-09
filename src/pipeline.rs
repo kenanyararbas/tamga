@@ -23,9 +23,7 @@ use crate::families::{self, Family, FamilyId};
 use crate::indexers::{self, ResolvedIndexer};
 use crate::merge::{self, rebase};
 use crate::prepare::{self, INDEX_STEP_ID, PrepareCtx};
-use crate::report::{
-    IndexerInfo, RootReport, RootStats, RootStatus, RunReport, StepReport, Totals,
-};
+use crate::report::{IndexerInfo, RootReport, RootStats, RootStatus, RunReport, StepReport};
 use crate::workspace::{RunWorkspace, Workspace, enforce_run_retention, generate_run_id};
 
 /// A root that resolved an indexer and has a task to run.
@@ -93,7 +91,16 @@ pub fn run_index(args: &IndexArgs) -> i32 {
             Vec::new(),
             0,
         );
-        return finalize_empty(&report, args);
+        // Still write the (empty) report so a run always leaves a record.
+        if let Ok(run) = create_run_workspace(&workspace, args) {
+            let report_path = run.out_dir.join("report.json");
+            write_report(&report_path, &report);
+            if let Some(dir) = &args.output {
+                copy_outputs(dir, &run.out_dir.join("index.scip"), &report_path, true);
+            }
+        }
+        println!("No roots to index.");
+        return report.exit_code;
     }
 
     let run = match create_run_workspace(&workspace, args) {
@@ -574,21 +581,6 @@ fn write_report(path: &Path, report: &RunReport) {
     }
 }
 
-/// Finalize the no-roots case: write an empty report and return exit 5
-/// (the shared exit-code map treats zero roots as "nothing detected").
-fn finalize_empty(report: &RunReport, args: &IndexArgs) -> i32 {
-    // Best-effort: write the (empty) report somewhere useful if an output
-    // dir was requested, else just print the summary.
-    if let Some(dir) = &args.output
-        && std::fs::create_dir_all(dir).is_ok()
-    {
-        let report_path = dir.join("report.json");
-        write_report(&report_path, report);
-    }
-    println!("No roots to index.");
-    report.exit_code
-}
-
 fn finish_report(
     repo: String,
     config_digest: String,
@@ -655,12 +647,6 @@ fn dir_display(dir: &Path) -> String {
 
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
-}
-
-// A small compile-time guard: Totals must stay the shape the summary reads.
-#[allow(dead_code)]
-fn _totals_shape(t: Totals) -> u32 {
-    t.indexed + t.degraded + t.skipped + t.cancelled + t.duplicate_documents
 }
 
 #[cfg(test)]

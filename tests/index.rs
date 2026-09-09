@@ -499,6 +499,27 @@ fn only_and_skip_family_filters() {
     assert!(dirs.contains(&"backend") && dirs.contains(&"frontend"));
 }
 
+// A run with no detected roots still writes a report and exits 5.
+#[test]
+fn empty_run_still_writes_a_report() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let out = tempdir().unwrap();
+
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .args(["index"])
+        .arg(repo.path())
+        .args(["--no-install", "--output"])
+        .arg(out.path())
+        .assert()
+        .code(5);
+
+    let report = read_report(out.path());
+    assert_eq!(report["roots"].as_array().unwrap().len(), 0);
+    assert_eq!(report["exit_code"], 5);
+}
+
 // 10. Repo-write invariant: a fake-indexer run must not modify the repo
 //     tree (the indexer writes only to the out path, outside the repo).
 #[test]
