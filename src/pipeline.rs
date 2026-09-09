@@ -498,9 +498,14 @@ fn mark_ready_envs(plans: &[RunnablePlan], report: &RunReport, no_install: bool)
 
 // --- .NET global.json relax/restore ------------------------------------
 
-/// One .NET root's global.json state for the life of the run.
+/// One relaxed `global.json` and the roots that share it. Two .NET roots in
+/// the same dir (two `.sln`s) point at the *same* `global.json`, so it is
+/// relaxed/backed-up/restored exactly once and the outcome is attributed to
+/// every sharing root -- relaxing it twice would back up the
+/// already-relaxed copy the second time and a later restore could leave the
+/// file relaxed.
 struct DotnetGlobalJson {
-    root_id: String,
+    root_ids: Vec<String>,
     state: GuardState,
 }
 
@@ -512,9 +517,10 @@ enum GuardState {
     RelaxFailed(String),
 }
 
-/// What happened to one root's global.json over the run, for reporting.
+/// What happened to one global.json over the run, attributed to every root
+/// that shares it, for reporting.
 struct GlobalJsonOutcome {
-    root_id: String,
+    root_ids: Vec<String>,
     kind: GlobalJsonOutcomeKind,
 }
 
@@ -535,9 +541,9 @@ fn dotnet_relax_enabled(config: &config::TamgaConfig) -> bool {
         .unwrap_or(true)
 }
 
-/// Back up and relax the `global.json` of every runnable .NET root that has
-/// one (when `relax_global_json` is enabled). Returns the guards to hold
-/// for the run.
+/// Back up and relax each distinct `global.json` used by a runnable .NET
+/// root (when `relax_global_json` is enabled), deduped by path so a shared
+/// file is relaxed exactly once. Returns the guards to hold for the run.
 fn relax_dotnet_global_jsons(
     plans: &[RunnablePlan],
     repo_abs: &Path,
@@ -547,7 +553,11 @@ fn relax_dotnet_global_jsons(
     if !dotnet_relax_enabled(config) {
         return Vec::new();
     }
-    let mut out = Vec::new();
+    // Group the runnable .NET roots by their (deduped) global.json path,
+    // preserving first-seen order for determinism.
+    let mut order: Vec<PathBuf> = Vec::new();
+    let mut roots_by_path: std::collections::BTreeMap<PathBuf, Vec<String>> =
+        std::collections::BTreeMap::new();
     for plan in plans {
         if plan.root.candidate.family != FamilyId::Dotnet {
             continue;
@@ -557,25 +567,35 @@ fn relax_dotnet_global_jsons(
         if !global_json.is_file() {
             continue;
         }
+        if !roots_by_path.contains_key(&global_json) {
+            order.push(global_json.clone());
+        }
+        roots_by_path
+            .entry(global_json)
+            .or_default()
+            .push(plan.root.id.clone());
+    }
+
+    let mut out = Vec::new();
+    for global_json in order {
+        let root_ids = roots_by_path.remove(&global_json).unwrap_or_default();
+        // Back up under the first sharing root's id (stable and unique).
         let backup = run
             .dir
             .join("backup")
-            .join(&plan.root.id)
+            .join(&root_ids[0])
             .join("global.json");
         let state = match GlobalJsonGuard::relax(&global_json, &backup) {
             Ok(guard) => GuardState::Relaxed(guard),
             Err(e) => GuardState::RelaxFailed(e.to_string()),
         };
-        out.push(DotnetGlobalJson {
-            root_id: plan.root.id.clone(),
-            state,
-        });
+        out.push(DotnetGlobalJson { root_ids, state });
     }
     out
 }
 
 /// Restore every relaxed global.json (idempotent with each guard's Drop),
-/// capturing per-root outcomes for the report.
+/// capturing per-file outcomes for the report.
 fn restore_dotnet_global_jsons(items: &mut [DotnetGlobalJson]) -> Vec<GlobalJsonOutcome> {
     items
         .iter_mut()
@@ -597,7 +617,7 @@ fn restore_dotnet_global_jsons(items: &mut [DotnetGlobalJson]) -> Vec<GlobalJson
                 GuardState::RelaxFailed(msg) => GlobalJsonOutcomeKind::RelaxFailed(msg.clone()),
             };
             GlobalJsonOutcome {
-                root_id: item.root_id.clone(),
+                root_ids: item.root_ids.clone(),
                 kind,
             }
         })
@@ -610,28 +630,30 @@ fn restore_dotnet_global_jsons(items: &mut [DotnetGlobalJson]) -> Vec<GlobalJson
 /// itself never happened.
 fn apply_global_json_outcomes(reports: &mut [RootReport], outcomes: &[GlobalJsonOutcome]) {
     for outcome in outcomes {
-        let Some(report) = reports.iter_mut().find(|r| r.id == outcome.root_id) else {
-            continue;
-        };
-        match &outcome.kind {
-            GlobalJsonOutcomeKind::Restored => {
-                report
-                    .repo_writes
-                    .push("temporarily relaxed global.json (restored)".to_string());
-            }
-            GlobalJsonOutcomeKind::RestoreFailed { backup } => {
-                report
-                    .repo_writes
-                    .push("global.json relaxed but NOT restored".to_string());
-                report.notes.push(format!(
-                    "FAILED to restore global.json — original at {}",
-                    backup.display()
-                ));
-            }
-            GlobalJsonOutcomeKind::RelaxFailed(msg) => {
-                report
-                    .notes
-                    .push(format!("could not relax global.json: {msg}"));
+        for root_id in &outcome.root_ids {
+            let Some(report) = reports.iter_mut().find(|r| &r.id == root_id) else {
+                continue;
+            };
+            match &outcome.kind {
+                GlobalJsonOutcomeKind::Restored => {
+                    report
+                        .repo_writes
+                        .push("temporarily relaxed global.json (restored)".to_string());
+                }
+                GlobalJsonOutcomeKind::RestoreFailed { backup } => {
+                    report
+                        .repo_writes
+                        .push("global.json relaxed but NOT restored".to_string());
+                    report.notes.push(format!(
+                        "FAILED to restore global.json — original at {}",
+                        backup.display()
+                    ));
+                }
+                GlobalJsonOutcomeKind::RelaxFailed(msg) => {
+                    report
+                        .notes
+                        .push(format!("could not relax global.json: {msg}"));
+                }
             }
         }
     }

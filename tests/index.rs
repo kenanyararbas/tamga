@@ -1293,6 +1293,94 @@ fn m6_dotnet_relax_global_json_can_be_disabled() {
     );
 }
 
+// Two .NET roots in one dir share a single global.json: it must be relaxed
+// and restored exactly once (byte-identical), with a single backup, and
+// both roots credited with the relax in their repo_writes. A naive
+// per-root relax would back up the already-relaxed copy the second time and
+// leave the file relaxed.
+#[test]
+fn m6_dotnet_two_slns_share_one_global_json_restored_exactly_once() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let ws = tempdir().unwrap();
+    let path_dir = tempdir().unwrap();
+    write_fake_dotnet(path_dir.path());
+
+    fs::write(repo.path().join("One.sln"), "solution one\n").unwrap();
+    fs::write(repo.path().join("Two.sln"), "solution two\n").unwrap();
+    fs::write(repo.path().join("global.json"), GLOBAL_JSON).unwrap();
+    fs::write(repo.path().join("Program.cs"), "class P {}\n").unwrap();
+    let fake = fake_indexer();
+    let fake = fake.to_str().unwrap();
+    fs::write(
+        repo.path().join(".tamga.toml"),
+        format!(
+            "[indexers.scip-dotnet]\npath = \"{fake}\"\nargs = [\"--scip-doc\", \"Program.cs\"]\n"
+        ),
+    )
+    .unwrap();
+
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .env("PATH", scratch_path(path_dir.path()))
+        .args(["index"])
+        .arg(repo.path())
+        .arg("--workspace")
+        .arg(ws.path())
+        .assert()
+        .code(0);
+
+    // global.json restored byte-for-byte (not left relaxed by the 2nd root).
+    assert_eq!(
+        fs::read_to_string(repo.path().join("global.json")).unwrap(),
+        GLOBAL_JSON,
+        "a shared global.json must be restored exactly once"
+    );
+
+    // Exactly one backup file exists (one relax, not two).
+    let backup_root = ws.path().join("backup");
+    let backup_count = walkdir_count_global_json(&backup_root);
+    assert_eq!(backup_count, 1, "expected a single global.json backup");
+
+    // Both roots credit the relax in their repo_writes.
+    let report = read_report(&ws.path().join("out"));
+    for id in ["root+dotnet+One", "root+dotnet+Two"] {
+        let root = report["roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == id)
+            .unwrap_or_else(|| panic!("missing root {id}: {report:#}"));
+        let writes: Vec<&str> = root["repo_writes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(
+            writes.contains(&"temporarily relaxed global.json (restored)"),
+            "root {id} repo_writes: {writes:?}"
+        );
+    }
+}
+
+/// Count `global.json` files anywhere under `dir` (used to assert a single
+/// backup was taken).
+fn walkdir_count_global_json(dir: &Path) -> usize {
+    let mut count = 0;
+    if let Ok(rd) = fs::read_dir(dir) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                count += walkdir_count_global_json(&path);
+            } else if path.file_name().and_then(|n| n.to_str()) == Some("global.json") {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
 // 9. .NET cancellation: a slow index step is interrupted with SIGINT while
 // global.json is relaxed; the pipeline's restore path must still put it
 // back. Drives a real child process + `kill -INT`, mirroring the exec
