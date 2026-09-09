@@ -167,7 +167,7 @@ pub fn run_tasks(
             let results = &results;
             scope.spawn(move || {
                 let weight = task.weight.max(1) as i64;
-                let admitted = admit(&state, &cv, index, weight, cancel);
+                let admitted = admit(state, cv, index, weight, cancel);
                 if !admitted {
                     *results[index].lock().unwrap() = Some(RootTaskResult {
                         id: task.id.clone(),

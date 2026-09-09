@@ -58,6 +58,8 @@ pub enum IndexerId {
     RustAnalyzer,
     ScipRuby,
     ScipPhp,
+    ScipJava,
+    ScipDotnet,
 }
 
 impl IndexerId {
@@ -70,6 +72,8 @@ impl IndexerId {
             IndexerId::RustAnalyzer,
             IndexerId::ScipRuby,
             IndexerId::ScipPhp,
+            IndexerId::ScipJava,
+            IndexerId::ScipDotnet,
         ]
     }
 
@@ -83,6 +87,8 @@ impl IndexerId {
             IndexerId::RustAnalyzer => "rust-analyzer",
             IndexerId::ScipRuby => "scip-ruby",
             IndexerId::ScipPhp => "scip-php",
+            IndexerId::ScipJava => "scip-java",
+            IndexerId::ScipDotnet => "scip-dotnet",
         }
     }
 
@@ -421,6 +427,10 @@ fn acquire_error_reason(id: IndexerId, e: &AcquireError) -> String {
         AcquireError::ChecksumMismatch { asset } => format!("checksum mismatch for {asset}"),
         AcquireError::NpmMissing => format!("npm required to install {}", id.id_str()),
         AcquireError::ComposerMissing => format!("composer required to install {}", id.id_str()),
+        AcquireError::CoursierMissing => {
+            format!("coursier (cs) required to install {}", id.id_str())
+        }
+        AcquireError::DotnetMissing => format!("dotnet SDK required to install {}", id.id_str()),
         AcquireError::NoAssetForPlatform { triple } => format!(
             "no prebuilt {} binary for this platform ({triple})",
             id.id_str()

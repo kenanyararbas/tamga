@@ -216,10 +216,10 @@ pub fn load_effective_config(
     if let Some(partial) = load_partial_file(&home.join("config.toml"))? {
         config = apply_partial(config, partial);
     }
-    if let Some(repo) = repo {
-        if let Some(partial) = load_partial_file(&repo.join(".tamga.toml"))? {
-            config = apply_partial(config, partial);
-        }
+    if let Some(repo) = repo
+        && let Some(partial) = load_partial_file(&repo.join(".tamga.toml"))?
+    {
+        config = apply_partial(config, partial);
     }
     config = apply_partial(config, cli.into_partial());
 

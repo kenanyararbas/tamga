@@ -65,6 +65,18 @@ pub enum DistKind {
     /// Packagist metadata + dist archive hash) is the trust boundary, same
     /// rationale as `Npm`.
     Composer { package: String },
+    /// Installed via coursier: `cs install --contrib --install-dir <dir>
+    /// <app>:<version>`. scip-java ships no standalone binaries -- it's a
+    /// JVM app distributed through coursier's `contrib` channel (Maven
+    /// group `org.scip-code`), so coursier's own Maven-artifact integrity
+    /// (checksums resolved from the repositories) is the trust boundary,
+    /// same rationale as `Npm`/`Composer`. `app` is the coursier app name
+    /// (e.g. `scip-java`), not the full Maven coordinate.
+    Coursier { app: String },
+    /// Installed via `dotnet tool install <package> --tool-path <dir>
+    /// --version <version>`. NuGet's own package-integrity check is the
+    /// trust boundary, same rationale as `Npm`/`Composer`.
+    DotnetTool { package: String },
 }
 
 /// One indexer's pinned version and acquisition recipe.
@@ -150,6 +162,14 @@ fn parse_entry(id: &str, value: &toml::Value) -> Result<IndexerManifest, Manifes
         "composer" => {
             let package = required_str(table, id, "package")?;
             DistKind::Composer { package }
+        }
+        "coursier" => {
+            let app = required_str(table, id, "app")?;
+            DistKind::Coursier { app }
+        }
+        "dotnet-tool" => {
+            let package = required_str(table, id, "package")?;
+            DistKind::DotnetTool { package }
         }
         other => {
             return Err(ManifestError::UnknownDist {
@@ -312,6 +332,87 @@ mod tests {
                 assert_eq!(target.sha256.len(), 64);
             }
             other => panic!("expected github-release, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coursier_entry_has_app_name() {
+        let src = r#"
+            [scip-java]
+            version = "0.13.1"
+            dist = "coursier"
+            app = "scip-java"
+        "#;
+        let manifest = parse(src).unwrap();
+        match &manifest.get("scip-java").unwrap().dist {
+            DistKind::Coursier { app } => assert_eq!(app, "scip-java"),
+            other => panic!("expected coursier, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn coursier_missing_app_is_a_clear_error() {
+        let src = r#"
+            [x]
+            version = "1.0.0"
+            dist = "coursier"
+        "#;
+        assert_eq!(
+            parse(src).unwrap_err(),
+            ManifestError::MissingField {
+                id: "x".to_string(),
+                field: "app",
+            }
+        );
+    }
+
+    #[test]
+    fn dotnet_tool_entry_has_package_name() {
+        let src = r#"
+            [scip-dotnet]
+            version = "0.2.14"
+            dist = "dotnet-tool"
+            package = "scip-dotnet"
+        "#;
+        let manifest = parse(src).unwrap();
+        match &manifest.get("scip-dotnet").unwrap().dist {
+            DistKind::DotnetTool { package } => assert_eq!(package, "scip-dotnet"),
+            other => panic!("expected dotnet-tool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dotnet_tool_missing_package_is_a_clear_error() {
+        let src = r#"
+            [x]
+            version = "1.0.0"
+            dist = "dotnet-tool"
+        "#;
+        assert_eq!(
+            parse(src).unwrap_err(),
+            ManifestError::MissingField {
+                id: "x".to_string(),
+                field: "package",
+            }
+        );
+    }
+
+    #[test]
+    fn real_manifest_has_the_m6_indexers() {
+        let manifest = load().expect("assets/indexers.toml must parse");
+        let java = manifest.get("scip-java").expect("scip-java in manifest");
+        assert_eq!(java.version, "0.13.1");
+        match &java.dist {
+            DistKind::Coursier { app } => assert_eq!(app, "scip-java"),
+            other => panic!("expected coursier, got {other:?}"),
+        }
+        let dotnet = manifest
+            .get("scip-dotnet")
+            .expect("scip-dotnet in manifest");
+        assert_eq!(dotnet.version, "0.2.14");
+        match &dotnet.dist {
+            DistKind::DotnetTool { package } => assert_eq!(package, "scip-dotnet"),
+            other => panic!("expected dotnet-tool, got {other:?}"),
         }
     }
 

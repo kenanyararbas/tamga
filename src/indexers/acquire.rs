@@ -57,6 +57,10 @@ pub enum AcquireError {
     NpmMissing,
     #[error("composer is required to install this indexer but was not found on PATH")]
     ComposerMissing,
+    #[error("coursier (cs) is required to install this indexer but was not found on PATH")]
+    CoursierMissing,
+    #[error("the dotnet SDK is required to install this indexer but was not found on PATH")]
+    DotnetMissing,
     #[error("{program} exited with {exit_code:?}")]
     CommandFailed {
         program: String,
@@ -122,6 +126,11 @@ pub fn binary_path(dist: &DistKind, version_dir: &Path, bin_name: &str) -> PathB
         DistKind::GithubRelease { .. } => version_dir.join(bin_name),
         DistKind::Npm { .. } => version_dir.join("node_modules").join(".bin").join(bin_name),
         DistKind::Composer { .. } => version_dir.join("vendor").join("bin").join(bin_name),
+        // `cs install --install-dir <dir>` and `dotnet tool install
+        // --tool-path <dir>` both drop a launcher named after the app
+        // directly into `<dir>`.
+        DistKind::Coursier { .. } => version_dir.join(bin_name),
+        DistKind::DotnetTool { .. } => version_dir.join(bin_name),
     }
 }
 
@@ -155,6 +164,44 @@ pub fn composer_require_argv(package: &str, version: &str, dir: &Path) -> (Strin
             dir.display().to_string(),
             "--no-interaction".to_string(),
             format!("{package}:{version}"),
+        ],
+    )
+}
+
+/// Pure argv construction for the coursier `cs install` invocation, split
+/// out so tests can assert on it directly without ever running real `cs`.
+/// `--contrib` reaches the community channel scip-java is published to,
+/// `--install-dir <dir>` targets tamga's own managed cache entry (never a
+/// shared user location), and `<app>:<version>` pins the exact release.
+pub fn coursier_install_argv(app: &str, version: &str, dir: &Path) -> (String, Vec<String>) {
+    (
+        "cs".to_string(),
+        vec![
+            "install".to_string(),
+            "--contrib".to_string(),
+            "--install-dir".to_string(),
+            dir.display().to_string(),
+            format!("{app}:{version}"),
+        ],
+    )
+}
+
+/// Pure argv construction for the `dotnet tool install` invocation, split
+/// out so tests can assert on it directly without ever running real
+/// `dotnet`. `--tool-path <dir>` targets tamga's own managed cache entry
+/// (a path-scoped install, never the machine-global `--global` store) and
+/// `--version <version>` pins the exact release.
+pub fn dotnet_tool_install_argv(package: &str, version: &str, dir: &Path) -> (String, Vec<String>) {
+    (
+        "dotnet".to_string(),
+        vec![
+            "tool".to_string(),
+            "install".to_string(),
+            package.to_string(),
+            "--tool-path".to_string(),
+            dir.display().to_string(),
+            "--version".to_string(),
+            version.to_string(),
         ],
     )
 }
@@ -200,6 +247,10 @@ pub fn install(
         DistKind::Npm { package } => install_npm(package, version, &staging_dir, INSTALL_TIMEOUT),
         DistKind::Composer { package } => {
             install_composer(package, version, &staging_dir, INSTALL_TIMEOUT)
+        }
+        DistKind::Coursier { app } => install_coursier(app, version, &staging_dir, INSTALL_TIMEOUT),
+        DistKind::DotnetTool { package } => {
+            install_dotnet_tool(package, version, &staging_dir, INSTALL_TIMEOUT)
         }
     };
 
@@ -395,6 +446,62 @@ fn install_composer(
         return Err(AcquireError::ComposerMissing);
     }
     let (program, args) = composer_require_argv(package, version, staging_dir);
+    let mut cmd = Command::new(&program);
+    cmd.args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let status = run_with_timeout(cmd, timeout)?;
+    if !status.success() {
+        return Err(AcquireError::CommandFailed {
+            program,
+            exit_code: status.code(),
+        });
+    }
+    Ok(())
+}
+
+/// `timeout` is a parameter for the same reason as [`install_npm`]'s: tests
+/// exercise the kill-on-timeout path against a fake, slow "cs" without
+/// waiting the real budget.
+fn install_coursier(
+    app: &str,
+    version: &str,
+    staging_dir: &Path,
+    timeout: Duration,
+) -> Result<(), AcquireError> {
+    if super::find_on_path("cs").is_none() {
+        return Err(AcquireError::CoursierMissing);
+    }
+    let (program, args) = coursier_install_argv(app, version, staging_dir);
+    let mut cmd = Command::new(&program);
+    cmd.args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let status = run_with_timeout(cmd, timeout)?;
+    if !status.success() {
+        return Err(AcquireError::CommandFailed {
+            program,
+            exit_code: status.code(),
+        });
+    }
+    Ok(())
+}
+
+/// `timeout` is a parameter for the same reason as [`install_npm`]'s: tests
+/// exercise the kill-on-timeout path against a fake, slow "dotnet" without
+/// waiting the real budget.
+fn install_dotnet_tool(
+    package: &str,
+    version: &str,
+    staging_dir: &Path,
+    timeout: Duration,
+) -> Result<(), AcquireError> {
+    if super::find_on_path("dotnet").is_none() {
+        return Err(AcquireError::DotnetMissing);
+    }
+    let (program, args) = dotnet_tool_install_argv(package, version, staging_dir);
     let mut cmd = Command::new(&program);
     cmd.args(&args)
         .stdin(Stdio::null())
@@ -816,6 +923,118 @@ exit 0
                 "davidrjenni/scip-php:0.0.2",
             ]
         );
+    }
+
+    // --- coursier + dotnet-tool argv (pure, no real cs/dotnet ever runs) ---
+
+    #[test]
+    fn coursier_install_argv_builds_expected_command() {
+        let dir = PathBuf::from("/tools/scip-java/0.13.1");
+        let (program, args) = coursier_install_argv("scip-java", "0.13.1", &dir);
+        assert_eq!(program, "cs");
+        assert_eq!(
+            args,
+            vec![
+                "install",
+                "--contrib",
+                "--install-dir",
+                "/tools/scip-java/0.13.1",
+                "scip-java:0.13.1",
+            ]
+        );
+    }
+
+    #[test]
+    fn dotnet_tool_install_argv_builds_expected_command() {
+        let dir = PathBuf::from("/tools/scip-dotnet/0.2.14");
+        let (program, args) = dotnet_tool_install_argv("scip-dotnet", "0.2.14", &dir);
+        assert_eq!(program, "dotnet");
+        assert_eq!(
+            args,
+            vec![
+                "tool",
+                "install",
+                "scip-dotnet",
+                "--tool-path",
+                "/tools/scip-dotnet/0.2.14",
+                "--version",
+                "0.2.14",
+            ]
+        );
+    }
+
+    #[test]
+    fn binary_path_for_coursier_is_directly_in_version_dir() {
+        let dist = DistKind::Coursier {
+            app: "scip-java".to_string(),
+        };
+        let dir = PathBuf::from("/tools/scip-java/0.13.1");
+        assert_eq!(
+            binary_path(&dist, &dir, "scip-java"),
+            PathBuf::from("/tools/scip-java/0.13.1/scip-java")
+        );
+    }
+
+    #[test]
+    fn binary_path_for_dotnet_tool_is_directly_in_version_dir() {
+        let dist = DistKind::DotnetTool {
+            package: "scip-dotnet".to_string(),
+        };
+        let dir = PathBuf::from("/tools/scip-dotnet/0.2.14");
+        assert_eq!(
+            binary_path(&dist, &dir, "scip-dotnet"),
+            PathBuf::from("/tools/scip-dotnet/0.2.14/scip-dotnet")
+        );
+    }
+
+    #[test]
+    fn install_coursier_missing_from_path_is_coursier_missing() {
+        let _guard = path_guard();
+        let empty_dir = tempdir().unwrap();
+        let tmp = tempdir().unwrap();
+        let dist = DistKind::Coursier {
+            app: "scip-java".to_string(),
+        };
+        let old = std::env::var_os("PATH");
+        unsafe { std::env::set_var("PATH", empty_dir.path()) };
+        let result = install(
+            "scip-java",
+            &dist,
+            "0.13.1",
+            tmp.path(),
+            "scip-java",
+            &FakeFetcher::ok(Vec::new()),
+        );
+        match old {
+            Some(v) => unsafe { std::env::set_var("PATH", v) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+        assert!(matches!(result, Err(AcquireError::CoursierMissing)));
+    }
+
+    #[test]
+    fn install_dotnet_tool_missing_from_path_is_dotnet_missing() {
+        let _guard = path_guard();
+        let empty_dir = tempdir().unwrap();
+        let tmp = tempdir().unwrap();
+        let dist = DistKind::DotnetTool {
+            package: "scip-dotnet".to_string(),
+        };
+        let old = std::env::var_os("PATH");
+        unsafe { std::env::set_var("PATH", empty_dir.path()) };
+        let result = install(
+            "scip-dotnet",
+            &dist,
+            "0.2.14",
+            tmp.path(),
+            "scip-dotnet",
+            &FakeFetcher::ok(Vec::new()),
+        );
+        match old {
+            Some(v) => unsafe { std::env::set_var("PATH", v) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+        assert!(matches!(result, Err(AcquireError::DotnetMissing)));
     }
 
     #[test]

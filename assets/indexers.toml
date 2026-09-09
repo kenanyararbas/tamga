@@ -115,3 +115,35 @@ sha256 = "125982c27b59f8f35e6eb2904718789a4bdf28b0637baad9532977769b6058a7"
 version = "0.0.2"
 dist = "composer"
 package = "davidrjenni/scip-php"
+
+# M6 additions, verified 2026-09-09 (see task-7-report.md for the full
+# research trail):
+#
+# - scip-java: distributed via coursier only (no standalone release
+#   binaries; Docker + coursier launcher/bootstrap are the sole channels).
+#   The project was reorganized under the `scip-code` org: the Maven group
+#   moved from `com.sourcegraph` to `org.scip-code` and the CLI was
+#   rewritten in Kotlin (so the artifact is `scip-java`, no Scala `_2.13`
+#   suffix). Installed via the coursier `contrib` channel app name
+#   `scip-java` (`cs install --contrib --install-dir <dir> scip-java:<ver>`)
+#   -- see DistKind::Coursier. No separate sha256: coursier's own
+#   Maven-artifact integrity is the trust boundary, same as the npm/composer
+#   entries. Latest stable release is v0.13.1. Requires JDK 17+ to run.
+# - scip-dotnet: a .NET global/local tool published to NuGet under the id
+#   `scip-dotnet` (verified on nuget.org + the sourcegraph/scip-dotnet
+#   repo). Installed via `dotnet tool install scip-dotnet --tool-path <dir>
+#   --version <ver>` -- see DistKind::DotnetTool. NuGet's own package
+#   integrity is the trust boundary. Its `index` command takes a positional
+#   `.sln`/`.slnx`/`.csproj`/`.vbproj` target plus `--output <path>`
+#   (confirmed from ScipDotnet/Program.cs), matching the index-step argv.
+#   Latest version is 0.2.14.
+
+[scip-java]
+version = "0.13.1"
+dist = "coursier"
+app = "scip-java"
+
+[scip-dotnet]
+version = "0.2.14"
+dist = "dotnet-tool"
+package = "scip-dotnet"

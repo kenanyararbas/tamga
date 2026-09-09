@@ -53,12 +53,12 @@ impl Workspace {
     /// Resolves the home directory from `$TAMGA_HOME`, falling back to
     /// `$HOME/.tamga`. Does not touch the filesystem.
     pub fn resolve() -> Result<Self, WorkspaceError> {
-        if let Some(home) = std::env::var_os("TAMGA_HOME") {
-            if !home.is_empty() {
-                return Ok(Workspace {
-                    home: PathBuf::from(home),
-                });
-            }
+        if let Some(home) = std::env::var_os("TAMGA_HOME")
+            && !home.is_empty()
+        {
+            return Ok(Workspace {
+                home: PathBuf::from(home),
+            });
         }
         let home_dir = std::env::var_os("HOME").ok_or(WorkspaceError::HomeUnresolvable)?;
         Ok(Workspace {

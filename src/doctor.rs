@@ -56,6 +56,10 @@ const TOOLS: &[ToolCheck] = &[
         version_args: &["-version"],
     },
     ToolCheck {
+        name: "cs",
+        version_args: &["version"],
+    },
+    ToolCheck {
         name: "dotnet",
         version_args: &["--version"],
     },
