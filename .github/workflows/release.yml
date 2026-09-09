@@ -19,10 +19,18 @@ jobs:
             os: macos-latest
           - target: x86_64-apple-darwin
             os: macos-latest
+          # Pinned to 22.04 (glibc 2.35), NOT ubuntu-latest: a binary links
+          # against the builder's glibc and will not run on anything older.
+          # ubuntu-latest is 24.04 (glibc 2.39), which fails to start on
+          # Debian bookworm (glibc 2.36) -- the base image archie's Dockerfile
+          # installs tamga into -- with "GLIBC_2.39 not found". 2.35 is older
+          # than every currently-supported consumer, so it runs everywhere.
+          # Durable upgrade path: switch the linux targets to *-linux-musl for
+          # fully static binaries with no glibc floor at all.
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
