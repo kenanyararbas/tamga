@@ -386,6 +386,88 @@ fn has_step(root: &Value, id: &str) -> bool {
         .any(|s| s["id"] == id)
 }
 
+// 6b. `--no-install` must NOT warm the env cache: no venv is built, so the
+//     ready marker must be absent and a later normal run must still miss
+//     (with install steps present). Regression for the vacuous-warm bug.
+#[test]
+fn no_install_does_not_warm_the_env_cache() {
+    use tamga::families::FamilyId;
+
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    fs::write(
+        repo.path().join("pyproject.toml"),
+        "[project]\nname = \"p\"\nversion = \"0\"\n",
+    )
+    .unwrap();
+    fs::write(repo.path().join("src/app.py"), "x = 1\n").unwrap();
+    let fake = fake_indexer();
+    let fake = fake.to_str().unwrap();
+    fs::write(
+        repo.path().join(".tamga.toml"),
+        format!(
+            "[indexers.scip-python]\npath = \"{fake}\"\nargs = [\"--scip-doc\", \"src/app.py\"]\n"
+        ),
+    )
+    .unwrap();
+
+    // Run 1: --no-install. No env is constructed.
+    let out1 = tempdir().unwrap();
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .args(["index"])
+        .arg(repo.path())
+        .args(["--no-install", "--output"])
+        .arg(out1.path())
+        .assert()
+        .code(0);
+
+    let r1 = read_report(out1.path());
+    assert_eq!(root_by_dir(&r1, ".")["env_cache"], "miss");
+
+    // The env-ready marker must NOT have been written under --no-install.
+    let repo_canon = fs::canonicalize(repo.path()).unwrap();
+    let root_id = tamga::families::root_id(Path::new(""), FamilyId::Python);
+    let manifest = tamga::prepare::manifest_files(FamilyId::Python, &repo_canon, Path::new(""));
+    let hash = tamga::prepare::manifest_hash(&manifest);
+    let env_dir = tamga::workspace::Workspace::at(home.path()).env_cache_dir(&root_id, &hash);
+    assert!(
+        !env_dir.join(tamga::prepare::ENV_READY_MARKER).exists(),
+        "env cache was warmed under --no-install: {}",
+        env_dir.display()
+    );
+
+    // Run 2: a normal run must still see a miss and emit the venv step.
+    // Needs uv or python3 to build the venv.
+    if tamga::indexers::find_on_path("uv").is_none()
+        && tamga::indexers::find_on_path("python3").is_none()
+    {
+        eprintln!("skipping run-2 assertion: neither uv nor python3 on PATH");
+        return;
+    }
+    let out2 = tempdir().unwrap();
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .args(["index"])
+        .arg(repo.path())
+        .arg("--output")
+        .arg(out2.path())
+        .assert()
+        .code(0);
+
+    let r2 = read_report(out2.path());
+    let root2 = root_by_dir(&r2, ".");
+    assert_eq!(
+        root2["env_cache"], "miss",
+        "run2 should still miss: {root2:#}"
+    );
+    assert!(
+        has_step(root2, "venv"),
+        "run2 should build a venv: {root2:#}"
+    );
+}
+
 // 8. Malformed per-root output isolates to its own root.
 #[test]
 fn malformed_output_degrades_only_its_root() {

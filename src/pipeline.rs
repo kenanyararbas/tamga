@@ -253,7 +253,7 @@ pub fn run_index(args: &IndexArgs) -> i32 {
 
     // Mark warm env caches for successfully-prepared roots so the next run
     // can skip installs.
-    mark_ready_envs(&plans, &report);
+    mark_ready_envs(&plans, &report, args.no_install);
 
     report.exit_code
 }
@@ -375,11 +375,22 @@ fn build_root_report(
 }
 
 /// After a run, write the env-ready marker for each runnable root whose
-/// hard (`stop_on_fail`) prep steps all succeeded. A failed best-effort
-/// install still warms the cache (its failure is already a note), but a
-/// failed hard prerequisite (e.g. venv creation) must not -- otherwise the
-/// next run would skip rebuilding a broken env.
-fn mark_ready_envs(plans: &[RunnablePlan], report: &RunReport) {
+/// env was actually built this run. A failed best-effort install still
+/// warms the cache (its failure is already a note), but a failed hard
+/// prerequisite (e.g. venv creation) must not -- otherwise the next run
+/// would skip rebuilding a broken env.
+///
+/// `--no-install` is a hard gate: it suppresses env construction entirely
+/// (families emit no prepare steps), so the marker must never be written
+/// on such a run. Otherwise a cold root would be marked ready vacuously
+/// (zero hard steps all "succeed"), and a later run *without*
+/// `--no-install` would see a hit, skip venv/install, and index against a
+/// nonexistent env with no note. A root whose cache was already warm keeps
+/// its existing marker regardless -- it was built on an earlier real run.
+fn mark_ready_envs(plans: &[RunnablePlan], report: &RunReport, no_install: bool) {
+    if no_install {
+        return;
+    }
     for plan in plans {
         let Some(row) = report.roots.iter().find(|r| r.id == plan.root.id) else {
             continue;
