@@ -26,6 +26,8 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::time::Duration;
 
+use crate::detect::evidence::Evidence;
+use crate::detect::walker::{MarkerHit, WalkStats};
 use crate::detect::{ResolvedRoot, RootCandidate, RootStrength};
 use crate::exec::ExecStep;
 use crate::families::{self, Family, FamilyId, FamilyMeta, MarkerKind, MarkerSpec};
@@ -78,15 +80,15 @@ impl Family for Php {
 
     fn candidates(
         &self,
-        hits: &[crate::detect::walker::MarkerHit],
-        _stats: &crate::detect::walker::WalkStats,
+        hits: &[MarkerHit],
+        _stats: &WalkStats,
         _repo: &Path,
     ) -> Vec<RootCandidate> {
         hits.iter()
             .filter(|h| h.kind == MarkerKind::ComposerJson)
             .map(|h| {
                 let dir = h.path.parent().unwrap_or(Path::new("")).to_path_buf();
-                let evidence = vec![crate::detect::evidence::Evidence::marker(
+                let evidence = vec![Evidence::marker(
                     h.path.clone(),
                     "composer.json".to_string(),
                 )];
