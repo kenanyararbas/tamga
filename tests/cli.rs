@@ -360,3 +360,52 @@ fn clean_with_no_directories_present_reports_nothing_to_remove() {
         .success()
         .stdout(predicate::str::contains("nothing to remove"));
 }
+
+// Live smoke test (gated): a real `tamga indexers install scip-go` against
+// the real sourcegraph/scip-go GitHub release, into a scratch TAMGA_HOME.
+// Runs only under `cargo test -- --ignored` with TAMGA_LIVE=1 set (real
+// network access required) -- never part of a normal `cargo test`.
+#[test]
+#[ignore = "requires network and TAMGA_LIVE=1"]
+fn live_indexers_install_scip_go_produces_a_runnable_binary() {
+    if std::env::var("TAMGA_LIVE").is_err() {
+        eprintln!("skipping live test: set TAMGA_LIVE=1 to enable");
+        return;
+    }
+
+    let home = tempdir().unwrap();
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .args(["indexers", "install", "scip-go"])
+        .assert()
+        .success();
+
+    let manifest = tamga::indexers::manifest::load().expect("embedded manifest parses");
+    let version = &manifest
+        .get("scip-go")
+        .expect("scip-go in manifest")
+        .version;
+    let bin = home
+        .path()
+        .join("tools")
+        .join("scip-go")
+        .join(version)
+        .join("scip-go");
+    assert!(
+        bin.is_file(),
+        "expected installed binary at {}",
+        bin.display()
+    );
+
+    let output = std::process::Command::new(&bin)
+        .arg("--version")
+        .output()
+        .unwrap_or_else(|e| panic!("failed to run installed binary {}: {e}", bin.display()));
+    assert!(
+        output.status.success(),
+        "scip-go --version exited {:?}: stdout={} stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
