@@ -8,7 +8,7 @@
 //! test here is a defect per the task brief.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use tamga::exec::{
@@ -30,22 +30,22 @@ fn osstr(s: &str) -> OsString {
 fn indexer_step(
     id: &str,
     extra_args: &[&str],
-    cwd: &PathBuf,
-    log_path: &PathBuf,
-    record_path: &PathBuf,
+    cwd: &Path,
+    log_path: &Path,
+    record_path: &Path,
 ) -> ExecStep {
     let mut argv = vec![osstr(fake_indexer().to_str().unwrap())];
     argv.extend(extra_args.iter().map(|s| osstr(s)));
     ExecStep {
         id: id.to_string(),
         argv,
-        cwd: cwd.clone(),
+        cwd: cwd.to_path_buf(),
         env: vec![(
             osstr("FAKE_RECORD_PATH"),
             osstr(record_path.to_str().unwrap()),
         )],
         timeout: Duration::from_secs(30),
-        log_path: log_path.clone(),
+        log_path: log_path.to_path_buf(),
         stop_on_fail: true,
     }
 }
