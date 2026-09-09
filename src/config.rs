@@ -320,6 +320,19 @@ mod tests {
     }
 
     #[test]
+    fn malformed_repo_toml_is_a_config_error() {
+        // Same contract as the home-tier file above, but for
+        // `<repo>/.tamga.toml`. No M0 command actually loads a malformed
+        // repo config end-to-end (doctor never loads config, and clean
+        // has no repo-scoped path), so this is covered at this level.
+        let home = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        fs::write(repo.path().join(".tamga.toml"), "not = [ valid").unwrap();
+        let result = load_effective_config(home.path(), Some(repo.path()), CliOverrides::default());
+        assert!(matches!(result, Err(ConfigError::Parse { .. })));
+    }
+
+    #[test]
     fn digest_is_stable_for_the_same_config() {
         let cfg = TamgaConfig::default();
         let d1 = cfg.digest().unwrap();

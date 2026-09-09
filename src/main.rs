@@ -4,10 +4,12 @@
 //! commands each have their own small, fixed mapping documented inline).
 //!
 //! Expected, modeled failures (bad config, an unresolvable home dir) are
-//! handled explicitly below and turned into their specific exit codes.
-//! Anything else -- the "1 = internal error/panic" case -- propagates as
-//! an `anyhow::Error`; returning it from `main` prints it and exits 1,
-//! which is exactly that mapping.
+//! usage/environment problems, not internal errors -- they're handled
+//! explicitly below and exit 2. Anything else -- the "1 = internal
+//! error/panic" case -- propagates as an `anyhow::Error`; returning it
+//! from `main` prints it and exits 1, which is exactly that mapping.
+//! `detect`/`index`/`indexers`/`merge` are the one deliberate exception:
+//! the brief mandates they exit 1 as stubs regardless of this scheme.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -50,16 +52,14 @@ fn stub(name: &str) -> i32 {
     1
 }
 
+/// `doctor` is purely informational in M0: it never touches config or
+/// tamga's home directory, and always exits 0 (brief §7). It only checks
+/// what's on `PATH`.
 fn run_doctor(args: DoctorArgs) -> i32 {
     let repo = args.path.unwrap_or_else(|| PathBuf::from("."));
-    match load_config(Some(&repo)) {
-        Ok(_) => {
-            tracing::debug!(repo = %repo.display(), "running doctor checks");
-            println!("{}", tamga::doctor::run(Some(&repo)));
-            0
-        }
-        Err(code) => code,
-    }
+    tracing::debug!(repo = %repo.display(), "running doctor checks");
+    println!("{}", tamga::doctor::run(Some(&repo)));
+    0
 }
 
 fn run_clean(args: CleanArgs) -> i32 {
@@ -95,8 +95,10 @@ fn run_clean(args: CleanArgs) -> i32 {
             0
         }
         Err(e) => {
+            // A filesystem failure while cleaning (e.g. permission denied)
+            // is an environmental problem, not an internal bug -- exit 2.
             eprintln!("tamga clean: {e}");
-            1
+            2
         }
     }
 }
@@ -107,8 +109,10 @@ fn run_clean(args: CleanArgs) -> i32 {
 /// Returns the workspace too since most callers need both.
 fn load_config(repo: Option<&Path>) -> Result<(Workspace, TamgaConfig), i32> {
     let workspace = Workspace::resolve().map_err(|e| {
+        // An unresolvable home dir (no TAMGA_HOME or HOME) is an
+        // environment problem, not an internal bug -- exit 2.
         eprintln!("tamga: {e}");
-        1
+        2
     })?;
     let config =
         tamga::config::load_effective_config(&workspace.home, repo, CliOverrides::default())

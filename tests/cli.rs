@@ -46,8 +46,13 @@ fn doctor_accepts_an_explicit_path() {
         .success();
 }
 
+// `doctor` is purely informational in M0 (brief §7: "exit 0 always"). It
+// must never load config, so a malformed `.tamga.toml`/`config.toml`
+// should have zero effect on it -- these two tests pin that down. The
+// malformed-config -> exit 2 contract itself is exercised below through
+// `clean`, the one M0 command that actually loads config.
 #[test]
-fn malformed_home_config_exits_2() {
+fn doctor_ignores_malformed_home_config() {
     let home = tempdir().unwrap();
     fs::write(home.path().join("config.toml"), "this is not [ valid toml").unwrap();
 
@@ -55,12 +60,12 @@ fn malformed_home_config_exits_2() {
         .env("TAMGA_HOME", home.path())
         .arg("doctor")
         .assert()
-        .code(2)
-        .stderr(predicate::str::contains("config error"));
+        .success()
+        .stdout(predicate::str::contains("git"));
 }
 
 #[test]
-fn malformed_repo_config_exits_2() {
+fn doctor_ignores_malformed_repo_config() {
     let home = tempdir().unwrap();
     let repo = tempdir().unwrap();
     fs::write(repo.path().join(".tamga.toml"), "not = [ valid").unwrap();
@@ -70,8 +75,72 @@ fn malformed_repo_config_exits_2() {
         .arg("doctor")
         .arg(repo.path())
         .assert()
+        .success()
+        .stdout(predicate::str::contains("git"));
+}
+
+#[test]
+fn clean_exits_2_on_malformed_home_config() {
+    let home = tempdir().unwrap();
+    fs::write(home.path().join("config.toml"), "this is not [ valid toml").unwrap();
+
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .arg("clean")
+        .assert()
         .code(2)
         .stderr(predicate::str::contains("config error"));
+}
+
+#[test]
+fn clean_exits_2_when_home_is_unresolvable() {
+    // Neither TAMGA_HOME nor HOME is set, so Workspace::resolve() fails.
+    // That's an environment problem, not an internal bug -- exit 2, not 1.
+    tamga()
+        .env_remove("TAMGA_HOME")
+        .env_remove("HOME")
+        .arg("clean")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("tamga:"));
+}
+
+#[cfg(unix)]
+#[test]
+fn clean_exits_2_on_filesystem_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempdir().unwrap();
+    fs::create_dir_all(home.path().join("runs").join("20260101-000000-aaaa")).unwrap();
+
+    // Removing home/runs requires unlinking its directory entry from
+    // `home`, which requires write permission on `home` itself. Drop that
+    // so `clean` hits a real permission-denied error instead of succeeding.
+    let mut perms = fs::metadata(home.path()).unwrap().permissions();
+    perms.set_mode(0o500);
+    fs::set_permissions(home.path(), perms).unwrap();
+
+    let mut cmd = tamga();
+    cmd.env("TAMGA_HOME", home.path()).arg("clean");
+    let output = cmd.output().unwrap();
+
+    // Restore permissions immediately so the tempdir can clean itself up
+    // regardless of what the assertions below find.
+    let mut perms = fs::metadata(home.path()).unwrap().permissions();
+    perms.set_mode(0o700);
+    fs::set_permissions(home.path(), perms).unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("tamga clean:"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
