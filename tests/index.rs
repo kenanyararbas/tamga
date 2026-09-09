@@ -176,12 +176,15 @@ fn one_missing_indexer_degrades_only_its_root() {
     );
     fs::write(repo.path().join(".tamga.toml"), cfg).unwrap();
 
+    // --offline: with scip-typescript unpinned and PATH hidden, resolution
+    // must degrade rather than attempt a real download (cargo test must
+    // never touch the network).
     tamga()
         .env("TAMGA_HOME", home.path())
         .env("PATH", empty_path.path())
         .args(["index"])
         .arg(repo.path())
-        .args(["--no-install", "--output"])
+        .args(["--no-install", "--offline", "--output"])
         .arg(out.path())
         .assert()
         .code(3);
@@ -191,10 +194,9 @@ fn one_missing_indexer_degrades_only_its_root() {
     assert_eq!(root_by_dir(&report, "gosvc")["status"], "Indexed");
     let frontend = root_by_dir(&report, "frontend");
     assert_eq!(frontend["status"], "Degraded");
-    assert!(
-        frontend["reason"].as_str().unwrap().contains("not found"),
-        "reason: {}",
-        frontend["reason"]
+    assert_eq!(
+        frontend["reason"].as_str().unwrap(),
+        "indexer scip-typescript unavailable (offline)",
     );
 }
 
@@ -206,14 +208,14 @@ fn all_missing_indexers_degrade_everything() {
     let out = tempdir().unwrap();
     let empty_path = tempdir().unwrap();
     build_polyglot(repo.path());
-    // No pins at all, PATH hidden -> nothing resolves.
-
+    // No pins at all, PATH hidden, --offline -> nothing resolves and
+    // nothing is ever fetched (cargo test must never touch the network).
     tamga()
         .env("TAMGA_HOME", home.path())
         .env("PATH", empty_path.path())
         .args(["index"])
         .arg(repo.path())
-        .args(["--no-install", "--output"])
+        .args(["--no-install", "--offline", "--output"])
         .arg(out.path())
         .assert()
         .code(4);

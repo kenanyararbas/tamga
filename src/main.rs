@@ -8,9 +8,8 @@
 //! explicitly below and exit 2. Anything else -- the "1 = internal
 //! error/panic" case -- propagates as an `anyhow::Error`; returning it
 //! from `main` prints it and exits 1, which is exactly that mapping.
-//! `index`/`indexers`/`merge` are still stubs that exit 1 until their
-//! milestones land; `detect` (M1) is implemented and uses its own mapping
-//! (0 = roots found, 5 = none, 2 = malformed config).
+//! Each command otherwise has its own small, fixed exit-code mapping,
+//! documented inline above its `run_*` function.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -18,10 +17,11 @@ use std::process::ExitCode;
 use clap::Parser;
 
 use tamga::cli::{
-    CleanArgs, Cli, Command, DetectArgs, DoctorArgs, IndexArgs, IndexersAction, IndexersListArgs,
-    MergeArgs,
+    CleanArgs, Cli, Command, DetectArgs, DoctorArgs, IndexArgs, IndexersAction,
+    IndexersInstallArgs, IndexersListArgs, MergeArgs,
 };
 use tamga::config::{CliOverrides, TamgaConfig};
+use tamga::indexers::IndexerId;
 use tamga::workspace::{CleanTarget, Workspace};
 
 fn main() -> anyhow::Result<ExitCode> {
@@ -41,7 +41,7 @@ fn dispatch(cli: Cli) -> i32 {
         Command::Index(args) => run_index(args),
         Command::Indexers { action } => match action {
             IndexersAction::List(args) => run_indexers_list(args),
-            IndexersAction::Install(_) => stub("indexers install"),
+            IndexersAction::Install(args) => run_indexers_install(args),
         },
         Command::Merge(args) => run_merge(args),
         Command::Doctor(args) => run_doctor(args),
@@ -57,13 +57,20 @@ fn run_index(args: IndexArgs) -> i32 {
 }
 
 /// `indexers list` resolves every known indexer against the effective
-/// config (config pin -> PATH) and prints a table or JSON. Always exit 0.
+/// config, walking the pin -> PATH -> cache order (never downloading --
+/// `missing` covers "not cached either"), and prints a table or JSON.
+/// Always exit 0: an indexer being unresolvable is exactly what `list` is
+/// for reporting, not a failure of the command itself.
 fn run_indexers_list(args: IndexersListArgs) -> i32 {
-    let config = match load_config(Some(Path::new("."))) {
-        Ok((_workspace, config)) => config,
+    let (workspace, config) = match load_config(Some(Path::new("."))) {
+        Ok(pair) => pair,
         Err(code) => return code,
     };
-    let listings = tamga::indexers::list(&config);
+    let manifest = match tamga::indexers::manifest::load() {
+        Ok(m) => m,
+        Err(e) => return manifest_error(&e),
+    };
+    let listings = tamga::indexers::list(&config, &workspace, &manifest);
     if args.json {
         println!("{}", tamga::indexers::listing_to_json(&listings));
     } else {
@@ -72,17 +79,71 @@ fn run_indexers_list(args: IndexersListArgs) -> i32 {
     0
 }
 
+/// `indexers install [ID..] [--version V]` installs into tamga's managed
+/// cache, bypassing any config pin (an explicit install always populates
+/// the cache). No IDs means every manifest indexer. Exit 0 if every
+/// requested install succeeded, 4 if any failed (each failure is printed,
+/// so a partial run's cause is visible without re-running with `-v`), 2
+/// for an unrecognized indexer id (a usage error, caught before any
+/// installing starts).
+fn run_indexers_install(args: IndexersInstallArgs) -> i32 {
+    let (workspace, config) = match load_config(Some(Path::new("."))) {
+        Ok(pair) => pair,
+        Err(code) => return code,
+    };
+    let manifest = match tamga::indexers::manifest::load() {
+        Ok(m) => m,
+        Err(e) => return manifest_error(&e),
+    };
+
+    let ids: Vec<IndexerId> = if args.ids.is_empty() {
+        IndexerId::all().to_vec()
+    } else {
+        let mut resolved = Vec::with_capacity(args.ids.len());
+        for id_str in &args.ids {
+            match IndexerId::from_id_str(id_str) {
+                Some(id) => resolved.push(id),
+                None => {
+                    eprintln!("tamga indexers install: unknown indexer '{id_str}'");
+                    return 2;
+                }
+            }
+        }
+        resolved
+    };
+
+    let fetcher = tamga::indexers::acquire::UreqFetcher;
+    let results = tamga::indexers::run_install(
+        &ids,
+        args.version.as_deref(),
+        &config,
+        &workspace,
+        &manifest,
+        &fetcher,
+    );
+
+    let mut any_failed = false;
+    for r in &results {
+        match &r.outcome {
+            Ok(path) => println!("{}: installed -> {}", r.id.id_str(), path.display()),
+            Err(reason) => {
+                any_failed = true;
+                println!("{}: failed: {reason}", r.id.id_str());
+            }
+        }
+    }
+    if any_failed { 4 } else { 0 }
+}
+
+fn manifest_error(e: &tamga::indexers::manifest::ManifestError) -> i32 {
+    eprintln!("tamga: indexer manifest error: {e}");
+    2
+}
+
 /// Standalone `merge`: rebase each input onto `--repo-root` and merge into
 /// one index. Exit 0 on success, 2 on bad input / write failure.
 fn run_merge(args: MergeArgs) -> i32 {
     tamga::merge::run_merge(&args.a, &args.b, &args.repo_root, &args.output)
-}
-
-/// M0 has no detection/exec/merge engine yet; these commands are
-/// placeholders until later milestones fill them in.
-fn stub(name: &str) -> i32 {
-    eprintln!("tamga {name}: not yet implemented");
-    1
 }
 
 /// `detect` runs the M1 detection engine: load the effective config for

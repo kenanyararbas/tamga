@@ -117,6 +117,21 @@ pub fn run_index(args: &IndexArgs) -> i32 {
     let mut plans: Vec<RunnablePlan> = Vec::new();
     let mut pre_reports: Vec<RootReport> = Vec::new();
 
+    let indexer_manifest = match indexers::manifest::load() {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("tamga: indexer manifest error: {e}");
+            return 2;
+        }
+    };
+    let fetcher = indexers::acquire::UreqFetcher;
+    let resolve_opts = indexers::ResolveOptions {
+        workspace: &workspace,
+        manifest: &indexer_manifest,
+        offline: args.offline,
+        fetcher: &fetcher,
+    };
+
     for root in roots {
         let family_id = root.candidate.family;
         let Some(family) = family_for(&registry, family_id) else {
@@ -131,14 +146,12 @@ pub fn run_index(args: &IndexArgs) -> i32 {
         };
 
         let indexer_id = family.indexer();
-        let Some(resolved) = indexers::resolve(indexer_id, &config) else {
-            pre_reports.push(degraded_root(
-                &root,
-                None,
-                None,
-                format!("indexer {} not found (PATH)", indexer_id.id_str()),
-            ));
-            continue;
+        let resolved = match indexers::resolve(indexer_id, &config, &resolve_opts) {
+            Ok(resolved) => resolved,
+            Err(reason) => {
+                pre_reports.push(degraded_root(&root, None, None, reason));
+                continue;
+            }
         };
 
         let manifest = prepare::manifest_files(family_id, &repo_abs, &root.candidate.dir);

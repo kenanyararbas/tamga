@@ -255,15 +255,65 @@ fn indexers_list_runs_and_names_known_indexers() {
         .stdout(predicate::str::contains("scip-go"));
 }
 
+// `indexers list --json`: a scratch TAMGA_HOME and no config pins means
+// every indexer resolves to "missing" (none is on this test's real PATH
+// by construction -- an empty scratch PATH) with its manifest-pinned
+// version surfaced. Never touches the network: `list` only ever reports
+// pin/PATH/cache, it never downloads (see indexers::resolve_cached).
 #[test]
-fn indexers_install_is_still_a_stub() {
+fn indexers_list_json_reports_pinned_versions_for_missing_indexers() {
+    let home = tempdir().unwrap();
+    let empty_path = tempdir().unwrap();
+    let assert = tamga()
+        .env("TAMGA_HOME", home.path())
+        .env("PATH", empty_path.path())
+        .args(["indexers", "list", "--json"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let entries = json.as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    let go = entries
+        .iter()
+        .find(|e| e["id"] == "scip-go")
+        .expect("scip-go entry present");
+    assert_eq!(go["status"], "missing");
+    assert!(
+        go["pinned_version"].is_string(),
+        "scip-go pinned_version: {go:#}"
+    );
+}
+
+#[test]
+fn indexers_install_rejects_an_unknown_id() {
     let home = tempdir().unwrap();
     tamga()
         .env("TAMGA_HOME", home.path())
         .args(["indexers", "install", "some-indexer"])
         .assert()
-        .code(1)
-        .stderr(predicate::str::contains("not yet implemented"));
+        .code(2)
+        .stderr(predicate::str::contains("unknown indexer"));
+}
+
+// A deterministic, network-free failure path for `indexers install`: with
+// PATH stripped, the npm-dist indexers can't shell out to npm at all, so
+// this fails fast with the brief's exact "npm required" reason and never
+// reaches the network -- unlike scip-go (github-release), which is only
+// exercised by the gated TAMGA_LIVE test.
+#[test]
+fn indexers_install_reports_npm_missing_without_touching_the_network() {
+    let home = tempdir().unwrap();
+    let empty_path = tempdir().unwrap();
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .env("PATH", empty_path.path())
+        .args(["indexers", "install", "scip-python"])
+        .assert()
+        .code(4)
+        .stdout(predicate::str::contains(
+            "npm required to install scip-python",
+        ));
 }
 
 #[test]
