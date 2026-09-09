@@ -233,6 +233,7 @@ fn relative<'a>(child: &'a Path, ancestor: &Path) -> &'a Path {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn plain_package_has_no_workspace_table() {
@@ -292,5 +293,124 @@ mod tests {
     fn broken_toml_is_a_parse_error() {
         let toml = "this is not [ valid toml";
         assert!(matches!(parse_cargo_toml(toml), CargoParse::Error(_)));
+    }
+
+    // --- Family trait wiring: weight, index_step, check_prereqs -----------
+
+    fn test_root() -> ResolvedRoot {
+        ResolvedRoot {
+            id: "root+rust".to_string(),
+            candidate: RootCandidate {
+                family: FamilyId::Rust,
+                dir: PathBuf::new(),
+                strength: RootStrength::Project,
+                evidence: Vec::new(),
+                member_patterns: Vec::new(),
+                meta: FamilyMeta::Rust {
+                    exclude_patterns: Vec::new(),
+                },
+            },
+            subsumed: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn weight_is_2_heavy_because_rust_analyzer_drives_cargo_check() {
+        assert_eq!(Rust.weight(), 2);
+    }
+
+    #[test]
+    fn index_step_carries_cargo_target_dir_pointing_into_env_dir_and_the_brief_argv_shape() {
+        let repo = tempdir().unwrap();
+        let env_dir = tempdir().unwrap();
+        let run_ws = tempdir().unwrap();
+        let cfg = crate::config::TamgaConfig::default();
+        let ctx = PrepareCtx {
+            repo: repo.path(),
+            env_dir: env_dir.path(),
+            run_workspace: run_ws.path(),
+            config: &cfg,
+            indexer_argv0: PathBuf::from("rust-analyzer"),
+            no_install: false,
+            timeout_scale: 1.0,
+            env_cache_hit: false,
+        };
+        let root = test_root();
+        let out = PathBuf::from("/tmp/out/root+rust.scip");
+
+        let step = Rust.index_step(&root, &out, &ctx);
+
+        assert_eq!(
+            step.argv,
+            vec![
+                OsString::from("rust-analyzer"),
+                OsString::from("scip"),
+                OsString::from(repo.path()),
+                OsString::from("--output"),
+                OsString::from(&out),
+            ]
+        );
+        assert_eq!(step.cwd, repo.path());
+        assert_eq!(
+            step.env,
+            vec![(
+                OsString::from("CARGO_TARGET_DIR"),
+                OsString::from(env_dir.path().join("cargo-target")),
+            )]
+        );
+        assert!(step.stop_on_fail);
+    }
+
+    #[test]
+    fn prepare_emits_no_hard_steps() {
+        let repo = tempdir().unwrap();
+        let env_dir = tempdir().unwrap();
+        let run_ws = tempdir().unwrap();
+        let cfg = crate::config::TamgaConfig::default();
+        let ctx = PrepareCtx {
+            repo: repo.path(),
+            env_dir: env_dir.path(),
+            run_workspace: run_ws.path(),
+            config: &cfg,
+            indexer_argv0: PathBuf::from("rust-analyzer"),
+            no_install: false,
+            timeout_scale: 1.0,
+            env_cache_hit: false,
+        };
+        assert!(Rust.prepare(&test_root(), &ctx).is_empty());
+    }
+
+    #[test]
+    fn check_prereqs_fails_with_the_exact_reason_when_cargo_is_not_on_path() {
+        let _guard = crate::indexers::test_support::path_guard();
+        let empty_path = tempdir().unwrap();
+        let old = std::env::var_os("PATH");
+        unsafe { std::env::set_var("PATH", empty_path.path()) };
+
+        let repo = tempdir().unwrap();
+        let env_dir = tempdir().unwrap();
+        let run_ws = tempdir().unwrap();
+        let cfg = crate::config::TamgaConfig::default();
+        let ctx = PrepareCtx {
+            repo: repo.path(),
+            env_dir: env_dir.path(),
+            run_workspace: run_ws.path(),
+            config: &cfg,
+            indexer_argv0: PathBuf::from("rust-analyzer"),
+            no_install: false,
+            timeout_scale: 1.0,
+            env_cache_hit: false,
+        };
+        let result = Rust.check_prereqs(&test_root(), &ctx);
+
+        match old {
+            Some(v) => unsafe { std::env::set_var("PATH", v) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+
+        assert_eq!(
+            result,
+            Err("cargo required for rust-analyzer indexing".to_string())
+        );
     }
 }

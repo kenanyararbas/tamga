@@ -194,6 +194,7 @@ fn display_dir(dir: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn collect_gemspec_dirs_groups_by_containing_dir() {
@@ -219,5 +220,159 @@ mod tests {
     fn collect_gemspec_dirs_ignores_non_gemspec_files() {
         let files = vec![PathBuf::from("Gemfile.lock"), PathBuf::from("README.md")];
         assert!(collect_gemspec_dirs(&files).is_empty());
+    }
+
+    // --- Family trait wiring: prepare, index_step --------------------------
+
+    fn test_root() -> ResolvedRoot {
+        ResolvedRoot {
+            id: "root+ruby".to_string(),
+            candidate: RootCandidate {
+                family: FamilyId::Ruby,
+                dir: PathBuf::new(),
+                strength: RootStrength::Project,
+                evidence: Vec::new(),
+                member_patterns: Vec::new(),
+                meta: FamilyMeta::Ruby { has_gemfile: true },
+            },
+            subsumed: Vec::new(),
+        }
+    }
+
+    fn test_ctx<'a>(
+        repo: &'a std::path::Path,
+        env_dir: &'a std::path::Path,
+        run_ws: &'a std::path::Path,
+        cfg: &'a crate::config::TamgaConfig,
+        env_cache_hit: bool,
+        no_install: bool,
+    ) -> PrepareCtx<'a> {
+        PrepareCtx {
+            repo,
+            env_dir,
+            run_workspace: run_ws,
+            config: cfg,
+            indexer_argv0: PathBuf::from("scip-ruby"),
+            no_install,
+            timeout_scale: 1.0,
+            env_cache_hit,
+        }
+    }
+
+    #[test]
+    fn prepare_on_a_cold_cache_carries_bundle_path_pointing_into_env_dir() {
+        let repo = tempdir().unwrap();
+        let env_dir = tempdir().unwrap();
+        let run_ws = tempdir().unwrap();
+        let cfg = crate::config::TamgaConfig::default();
+        let ctx = test_ctx(
+            repo.path(),
+            env_dir.path(),
+            run_ws.path(),
+            &cfg,
+            false,
+            false,
+        );
+
+        let steps = Ruby.prepare(&test_root(), &ctx);
+
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].id, "bundle-install");
+        assert_eq!(
+            steps[0].argv,
+            vec![OsString::from("bundle"), OsString::from("install")]
+        );
+        assert_eq!(
+            steps[0].env,
+            vec![(
+                OsString::from("BUNDLE_PATH"),
+                OsString::from(env_dir.path().join("bundle")),
+            )]
+        );
+        assert!(!steps[0].stop_on_fail, "bundle install must be best-effort");
+    }
+
+    #[test]
+    fn prepare_is_skipped_on_env_cache_hit() {
+        let repo = tempdir().unwrap();
+        let env_dir = tempdir().unwrap();
+        let run_ws = tempdir().unwrap();
+        let cfg = crate::config::TamgaConfig::default();
+        let ctx = test_ctx(
+            repo.path(),
+            env_dir.path(),
+            run_ws.path(),
+            &cfg,
+            true,
+            false,
+        );
+        assert!(Ruby.prepare(&test_root(), &ctx).is_empty());
+    }
+
+    #[test]
+    fn prepare_is_skipped_under_no_install() {
+        let repo = tempdir().unwrap();
+        let env_dir = tempdir().unwrap();
+        let run_ws = tempdir().unwrap();
+        let cfg = crate::config::TamgaConfig::default();
+        let ctx = test_ctx(
+            repo.path(),
+            env_dir.path(),
+            run_ws.path(),
+            &cfg,
+            false,
+            true,
+        );
+        assert!(Ruby.prepare(&test_root(), &ctx).is_empty());
+    }
+
+    #[test]
+    fn prepare_is_skipped_when_install_is_never() {
+        let repo = tempdir().unwrap();
+        let env_dir = tempdir().unwrap();
+        let run_ws = tempdir().unwrap();
+        let cfg: crate::config::TamgaConfig =
+            toml::from_str("[families.ruby]\ninstall = \"never\"\n").unwrap();
+        let ctx = test_ctx(
+            repo.path(),
+            env_dir.path(),
+            run_ws.path(),
+            &cfg,
+            false,
+            false,
+        );
+        assert!(Ruby.prepare(&test_root(), &ctx).is_empty());
+    }
+
+    #[test]
+    fn index_step_matches_the_brief_argv_shape() {
+        let repo = tempdir().unwrap();
+        let env_dir = tempdir().unwrap();
+        let run_ws = tempdir().unwrap();
+        let cfg = crate::config::TamgaConfig::default();
+        let ctx = test_ctx(
+            repo.path(),
+            env_dir.path(),
+            run_ws.path(),
+            &cfg,
+            false,
+            false,
+        );
+        let out = PathBuf::from("/tmp/out/root+ruby.scip");
+
+        let step = Ruby.index_step(&test_root(), &out, &ctx);
+
+        assert_eq!(
+            step.argv,
+            vec![
+                OsString::from("scip-ruby"),
+                OsString::from("--index-file"),
+                OsString::from(&out),
+                OsString::from(repo.path()),
+            ]
+        );
+        assert_eq!(step.cwd, repo.path());
+        assert!(step.env.is_empty());
+        assert!(step.stop_on_fail);
     }
 }

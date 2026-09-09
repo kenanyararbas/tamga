@@ -173,3 +173,202 @@ fn install_allowed(ctx: &PrepareCtx) -> bool {
         .unwrap_or("auto");
     mode != "never"
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+
+    fn test_root() -> ResolvedRoot {
+        ResolvedRoot {
+            id: "root+php".to_string(),
+            candidate: RootCandidate {
+                family: FamilyId::Php,
+                dir: PathBuf::new(),
+                strength: RootStrength::Project,
+                evidence: Vec::new(),
+                member_patterns: Vec::new(),
+                meta: FamilyMeta::Php,
+            },
+            subsumed: Vec::new(),
+        }
+    }
+
+    fn test_ctx<'a>(
+        repo: &'a Path,
+        env_dir: &'a Path,
+        run_ws: &'a Path,
+        cfg: &'a crate::config::TamgaConfig,
+        env_cache_hit: bool,
+        no_install: bool,
+    ) -> PrepareCtx<'a> {
+        PrepareCtx {
+            repo,
+            env_dir,
+            run_workspace: run_ws,
+            config: cfg,
+            indexer_argv0: PathBuf::from("scip-php"),
+            no_install,
+            timeout_scale: 1.0,
+            env_cache_hit,
+        }
+    }
+
+    #[test]
+    fn prepare_defaults_to_auto_and_emits_composer_install() {
+        let repo = tempdir().unwrap();
+        let env_dir = tempdir().unwrap();
+        let run_ws = tempdir().unwrap();
+        let cfg = crate::config::TamgaConfig::default();
+        let ctx = test_ctx(
+            repo.path(),
+            env_dir.path(),
+            run_ws.path(),
+            &cfg,
+            false,
+            false,
+        );
+
+        let steps = Php.prepare(&test_root(), &ctx);
+
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].id, COMPOSER_INSTALL_STEP_ID);
+        assert_eq!(
+            steps[0].argv,
+            vec![
+                OsString::from("composer"),
+                OsString::from("install"),
+                OsString::from("--no-interaction"),
+            ]
+        );
+        assert_eq!(steps[0].cwd, repo.path());
+        assert!(!steps[0].stop_on_fail);
+    }
+
+    #[test]
+    fn prepare_is_skipped_under_no_install() {
+        let repo = tempdir().unwrap();
+        let env_dir = tempdir().unwrap();
+        let run_ws = tempdir().unwrap();
+        let cfg = crate::config::TamgaConfig::default();
+        let ctx = test_ctx(
+            repo.path(),
+            env_dir.path(),
+            run_ws.path(),
+            &cfg,
+            false,
+            true,
+        );
+        assert!(Php.prepare(&test_root(), &ctx).is_empty());
+    }
+
+    #[test]
+    fn prepare_is_skipped_when_install_is_never() {
+        let repo = tempdir().unwrap();
+        let env_dir = tempdir().unwrap();
+        let run_ws = tempdir().unwrap();
+        let cfg: crate::config::TamgaConfig =
+            toml::from_str("[families.php]\ninstall = \"never\"\n").unwrap();
+        let ctx = test_ctx(
+            repo.path(),
+            env_dir.path(),
+            run_ws.path(),
+            &cfg,
+            false,
+            false,
+        );
+        assert!(Php.prepare(&test_root(), &ctx).is_empty());
+    }
+
+    #[test]
+    fn prepare_is_skipped_on_env_cache_hit() {
+        let repo = tempdir().unwrap();
+        let env_dir = tempdir().unwrap();
+        let run_ws = tempdir().unwrap();
+        let cfg = crate::config::TamgaConfig::default();
+        let ctx = test_ctx(
+            repo.path(),
+            env_dir.path(),
+            run_ws.path(),
+            &cfg,
+            true,
+            false,
+        );
+        assert!(Php.prepare(&test_root(), &ctx).is_empty());
+    }
+
+    #[test]
+    fn index_step_wraps_the_indexer_in_a_move_out_shell_script() {
+        let repo = tempdir().unwrap();
+        let env_dir = tempdir().unwrap();
+        let run_ws = tempdir().unwrap();
+        let cfg = crate::config::TamgaConfig::default();
+        let ctx = test_ctx(
+            repo.path(),
+            env_dir.path(),
+            run_ws.path(),
+            &cfg,
+            false,
+            false,
+        );
+        let out = PathBuf::from("/tmp/out/root+php.scip");
+
+        let step = Php.index_step(&test_root(), &out, &ctx);
+
+        assert_eq!(
+            step.argv,
+            vec![
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from(INDEX_WRAPPER_SCRIPT),
+                OsString::from("scip-php-wrap"),
+                OsString::from("scip-php"),
+                OsString::from(&out),
+            ]
+        );
+        assert_eq!(step.cwd, repo.path());
+        assert!(step.stop_on_fail);
+    }
+
+    #[test]
+    fn wrapper_script_moves_stdout_indexer_output_and_preserves_exit_code() {
+        // Exercise the actual shell script (not just the argv shape) end to
+        // end against a real /bin/sh, without needing the pipeline or a
+        // real scip-php: the "indexer" is a tiny script that writes
+        // `index.scip` into its cwd and exits non-zero, proving both the
+        // move and the exit-code passthrough.
+        let dir = tempdir().unwrap();
+        let fake_indexer = dir.path().join("fake-scip-php.sh");
+        std::fs::write(&fake_indexer, b"#!/bin/sh\necho hi > index.scip\nexit 7\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_indexer, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let out = dir.path().join("out.scip");
+
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(INDEX_WRAPPER_SCRIPT)
+            .arg("scip-php-wrap")
+            .arg(&fake_indexer)
+            .arg(&out)
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+
+        assert_eq!(
+            status.code(),
+            Some(7),
+            "the indexer's own exit code must win"
+        );
+        assert!(out.is_file(), "index.scip should have been moved to out");
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "hi\n");
+        assert!(
+            !dir.path().join("index.scip").exists(),
+            "index.scip must not be left behind in the repo"
+        );
+    }
+}

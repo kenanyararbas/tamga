@@ -671,6 +671,364 @@ fn hash_tree(root: &Path) -> Vec<(String, Vec<u8>)> {
     out
 }
 
+// ---- M5: Rust, Ruby, PHP pipeline integration --------------------------
+
+fn read_records(path: &Path) -> Vec<Value> {
+    let text = fs::read_to_string(path).unwrap_or_default();
+    text.lines()
+        .map(|line| serde_json::from_str(line).expect("valid JSON record line"))
+        .collect()
+}
+
+/// Prepends `~/.cargo/bin` to the inherited `$PATH`, so a spawned `tamga`
+/// process can find `cargo` even when the outer test process's own `$PATH`
+/// doesn't already include it (this repo's convention: cargo lives at
+/// `~/.cargo/bin`).
+fn path_with_cargo_bin() -> String {
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    match std::env::var("HOME") {
+        Ok(home) => format!("{home}/.cargo/bin:{inherited}"),
+        Err(_) => inherited,
+    }
+}
+
+// 12. Rust: the index step's env carries CARGO_TARGET_DIR into the env
+//     dir (already unit-tested directly in families::rustlang), and its
+//     weight (2) really reaches the scheduler -- proven here by two
+//     independent Rust roots under a jobs=2 budget failing to overlap
+//     (each root alone consumes the whole budget).
+#[test]
+fn m5_case7_rust_root_weight_2_prevents_concurrent_execution_under_jobs_2() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let out = tempdir().unwrap();
+    let record_path = home.path().join("records.jsonl");
+
+    fs::create_dir_all(repo.path().join("cratea")).unwrap();
+    fs::write(
+        repo.path().join("cratea/Cargo.toml"),
+        "[package]\nname = \"cratea\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(repo.path().join("crateb")).unwrap();
+    fs::write(
+        repo.path().join("crateb/Cargo.toml"),
+        "[package]\nname = \"crateb\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    let fake = fake_indexer();
+    let fake = fake.to_str().unwrap();
+    fs::write(
+        repo.path().join(".tamga.toml"),
+        format!("[indexers.rust-analyzer]\npath = \"{fake}\"\nargs = [\"--sleep\", \"1.0\"]\n"),
+    )
+    .unwrap();
+
+    let _ = tamga()
+        .env("TAMGA_HOME", home.path())
+        .env("PATH", path_with_cargo_bin())
+        .env("FAKE_RECORD_PATH", &record_path)
+        .args(["index"])
+        .arg(repo.path())
+        .args(["--no-install", "--jobs", "2", "--output"])
+        .arg(out.path())
+        .assert();
+
+    let records = read_records(&record_path);
+    let start_of = |suffix: &str| -> u128 {
+        records
+            .iter()
+            .find(|r| r["cwd"].as_str().unwrap().ends_with(suffix))
+            .and_then(|r| r["start_ms"].as_u64())
+            .map(|v| v as u128)
+            .unwrap_or_else(|| panic!("no record with cwd ending in {suffix}: {records:#?}"))
+    };
+    let a_start = start_of("cratea");
+    let b_start = start_of("crateb");
+    let gap = a_start.abs_diff(b_start);
+    assert!(
+        gap > 700,
+        "two weight-2 Rust roots under a jobs=2 budget must run sequentially, \
+         not concurrently (gap was only {gap}ms against a 1000ms sleep)"
+    );
+}
+
+// 13. Ruby: bundle-install is present (with BUNDLE_PATH pointing into the
+//     env dir) on a cold cache, and absent on a warm one.
+#[test]
+fn m5_case8_ruby_bundle_install_present_on_miss_absent_on_hit() {
+    use tamga::families::FamilyId;
+
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    fs::write(
+        repo.path().join("Gemfile"),
+        "source 'https://rubygems.org'\n",
+    )
+    .unwrap();
+
+    let fake = fake_indexer();
+    let fake = fake.to_str().unwrap();
+    fs::write(
+        repo.path().join(".tamga.toml"),
+        format!("[indexers.scip-ruby]\npath = \"{fake}\"\n"),
+    )
+    .unwrap();
+
+    // A fake `bundle` on a scratch PATH that records the BUNDLE_PATH value
+    // it was invoked with, so the env-var plumbing is checked against a
+    // real (fake) process, not just the ExecStep struct.
+    let path_dir = tempdir().unwrap();
+    let marker = home.path().join("bundle-path-seen.txt");
+    fs::write(
+        path_dir.path().join("bundle"),
+        format!(
+            "#!/bin/sh\necho \"$BUNDLE_PATH\" > {}\nexit 0\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            path_dir.path().join("bundle"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+
+    let record_path = home.path().join("records.jsonl");
+    let out1 = tempdir().unwrap();
+    let _ = tamga()
+        .env("TAMGA_HOME", home.path())
+        .env(
+            "PATH",
+            format!("{}:/bin:/usr/bin", path_dir.path().display()),
+        )
+        .env("FAKE_RECORD_PATH", &record_path)
+        .args(["index"])
+        .arg(repo.path())
+        .arg("--output")
+        .arg(out1.path())
+        .assert();
+
+    let r1 = read_report(out1.path());
+    let root1 = root_by_dir(&r1, ".");
+    assert_eq!(root1["env_cache"], "miss", "run1: {root1:#}");
+    assert!(has_step(root1, "bundle-install"), "run1: {root1:#}");
+
+    // BUNDLE_PATH really was the per-root env dir's `bundle` subdir.
+    let repo_canon = fs::canonicalize(repo.path()).unwrap();
+    let root_id = tamga::families::root_id(Path::new(""), FamilyId::Ruby);
+    let manifest = tamga::prepare::manifest_files(FamilyId::Ruby, &repo_canon, Path::new(""));
+    let hash = tamga::prepare::manifest_hash(&manifest);
+    let env_dir = tamga::workspace::Workspace::at(home.path()).env_cache_dir(&root_id, &hash);
+    let seen_bundle_path = fs::read_to_string(&marker).unwrap();
+    assert_eq!(
+        seen_bundle_path.trim(),
+        env_dir.join("bundle").to_str().unwrap()
+    );
+
+    // The index step really did receive the brief's argv shape:
+    // `--index-file <out> <abs root dir>` (the fake indexer doesn't
+    // understand `--index-file`, so this run produces no index -- only
+    // argv/cwd are being checked here).
+    let records = read_records(&record_path);
+    let index_record = records
+        .iter()
+        .find(|r| r["cwd"].as_str().unwrap() == repo_canon.to_str().unwrap())
+        .expect("an index-step record for the repo root");
+    let argv: Vec<&str> = index_record["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(argv[1], "--index-file");
+    assert!(
+        argv[2].ends_with("root+ruby.scip") && Path::new(argv[2]).is_absolute(),
+        "argv[2] should be the absolute per-root out path, got {}",
+        argv[2]
+    );
+    assert_eq!(argv[3], repo_canon.to_str().unwrap());
+
+    // Run 2: warm cache, and `bundle` is nowhere on PATH at all -- if the
+    // pipeline incorrectly tried to run it again, this would fail loudly
+    // rather than silently reusing run 1's already-warm env.
+    let empty_path = tempdir().unwrap();
+    let out2 = tempdir().unwrap();
+    let _ = tamga()
+        .env("TAMGA_HOME", home.path())
+        .env("PATH", empty_path.path())
+        .args(["index"])
+        .arg(repo.path())
+        .arg("--output")
+        .arg(out2.path())
+        .assert();
+
+    let r2 = read_report(out2.path());
+    let root2 = root_by_dir(&r2, ".");
+    assert_eq!(root2["env_cache"], "hit", "run2: {root2:#}");
+    assert!(!has_step(root2, "bundle-install"), "run2: {root2:#}");
+}
+
+// 14. PHP: `install = "never"` means no composer-install step at all;
+//     the default `"auto"` (with a fake `composer` on a scratch PATH)
+//     means the step is present AND the report surfaces it as a
+//     `repo_writes` entry.
+#[test]
+fn m5_case9_php_install_gate_and_repo_writes() {
+    let fake = fake_indexer();
+    let fake = fake.to_str().unwrap();
+
+    // -- install = "never": no composer step, no repo_writes. --
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    fs::write(
+        repo.path().join("composer.json"),
+        "{\"name\": \"acme/app\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join(".tamga.toml"),
+        format!("[indexers.scip-php]\npath = \"{fake}\"\n[families.php]\ninstall = \"never\"\n"),
+    )
+    .unwrap();
+    let out = tempdir().unwrap();
+    let _ = tamga()
+        .env("TAMGA_HOME", home.path())
+        .env("PATH", "")
+        .args(["index"])
+        .arg(repo.path())
+        .arg("--output")
+        .arg(out.path())
+        .assert();
+    let report = read_report(out.path());
+    let root = root_by_dir(&report, ".");
+    assert!(!has_step(root, php_install_step_id()), "never: {root:#}");
+    assert!(
+        root["repo_writes"].as_array().unwrap().is_empty(),
+        "never: {root:#}"
+    );
+
+    // -- default "auto", with a fake composer on a scratch PATH: step
+    //    present, repo_writes surfaced. --
+    let home2 = tempdir().unwrap();
+    let repo2 = tempdir().unwrap();
+    fs::write(
+        repo2.path().join("composer.json"),
+        "{\"name\": \"acme/app\"}\n",
+    )
+    .unwrap();
+    fs::write(
+        repo2.path().join(".tamga.toml"),
+        format!("[indexers.scip-php]\npath = \"{fake}\"\n"),
+    )
+    .unwrap();
+    let path_dir = tempdir().unwrap();
+    fs::write(path_dir.path().join("composer"), "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            path_dir.path().join("composer"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    let out2 = tempdir().unwrap();
+    let _ = tamga()
+        .env("TAMGA_HOME", home2.path())
+        .env(
+            "PATH",
+            format!("{}:/bin:/usr/bin", path_dir.path().display()),
+        )
+        .args(["index"])
+        .arg(repo2.path())
+        .arg("--output")
+        .arg(out2.path())
+        .assert();
+    let report2 = read_report(out2.path());
+    let root2 = root_by_dir(&report2, ".");
+    assert!(has_step(root2, php_install_step_id()), "auto: {root2:#}");
+    let writes: Vec<&str> = root2["repo_writes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(writes, vec!["composer install created/updated vendor/"]);
+}
+
+fn php_install_step_id() -> &'static str {
+    "composer-install"
+}
+
+// 15. PHP move-wrap: scip-php only ever writes `./index.scip` into its
+//     cwd, so the index step wraps it and moves that file out to the real
+//     per-root output path. Proven end to end: the merged index has the
+//     expected document, and the repo tree is byte-identical before/after
+//     (install=never here keeps vendor/ out of the picture entirely, so
+//     the plain repo-write invariant applies without carve-outs).
+#[test]
+fn m5_case10_php_move_wrap_behavior() {
+    let home = tempdir().unwrap();
+    let repo = tempdir().unwrap();
+    let out = tempdir().unwrap();
+    fs::write(
+        repo.path().join("composer.json"),
+        "{\"name\": \"acme/app\"}\n",
+    )
+    .unwrap();
+    fs::write(repo.path().join("app.php"), "<?php\n").unwrap();
+
+    let fake = fake_indexer();
+    let fake = fake.to_str().unwrap();
+    fs::write(
+        repo.path().join(".tamga.toml"),
+        format!(
+            "[indexers.scip-php]\npath = \"{fake}\"\nargs = [\"--output\", \"index.scip\", \"--scip-doc\", \"app.php\"]\n"
+        ),
+    )
+    .unwrap();
+
+    let before = hash_tree(repo.path());
+
+    tamga()
+        .env("TAMGA_HOME", home.path())
+        .args(["index"])
+        .arg(repo.path())
+        .args(["--no-install", "--output"])
+        .arg(out.path())
+        .assert()
+        .code(0);
+
+    let report = read_report(out.path());
+    let root = root_by_dir(&report, ".");
+    assert_eq!(root["status"], "Indexed", "root: {root:#}");
+    let notes: Vec<&str> = root["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(
+        notes.contains(&"moved index.scip out of repo (temporary write)"),
+        "notes: {notes:?}"
+    );
+
+    let index = read_index(&out.path().join("index.scip"));
+    assert_eq!(doc_paths(&index), vec!["app.php".to_string()]);
+
+    let after = hash_tree(repo.path());
+    assert_eq!(
+        before, after,
+        "the repo tree must be unchanged once index.scip is moved out"
+    );
+}
+
 // 11. Standalone `merge` subcommand happy path.
 #[test]
 fn standalone_merge_combines_two_indexes() {
