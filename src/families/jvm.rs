@@ -21,9 +21,17 @@
 //!   `build_tool = Gradle` (both recorded in evidence).
 //!
 //! Per-root JDK selection rides the ambient toolchains (see
-//! [`crate::prepare::jdk`]): a parseable pin picks an installed JDK for the
-//! build's `JAVA_HOME`, while scip-java itself always runs on the ambient
-//! JDK 17+.
+//! [`crate::prepare::jdk`]): a parseable pin picks an installed JDK, which is
+//! handed to the index step as BOTH `JAVA_HOME` and a `PATH` prefix.
+//! `JAVA_HOME` alone is not enough: scip-java ships as a launcher that
+//! resolves `java` from `PATH`, and the javac it forks belongs to whichever
+//! JVM scip-java itself ended up on -- so with JDK 17 first on `PATH` a
+//! `<release>25` target fails with "release version 25 not supported" even
+//! though a JDK 25 is installed and `JAVA_HOME` points at it (live-verified
+//! against ThingsBoard, 2026-09-10). scip-java's own JDK 17+ floor is still
+//! checked against the ambient JVM in `check_prereqs`; prefixing `PATH` only
+//! ever raises the version it runs on, since selection never picks a JDK
+//! older than the pin.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -218,6 +226,17 @@ impl Family for Jvm {
         let mut env: Vec<(OsString, OsString)> =
             vec![(OsString::from("GRADLE_OPTS"), gradle_opts_value())];
         if let RootJdk::Use(home) = jdk::select_for_root(ctx.repo, &root.candidate.dir) {
+            // PATH as well as JAVA_HOME: scip-java's launcher takes `java`
+            // from PATH, and its forked javac follows that JVM, not
+            // JAVA_HOME (see module docs). Prefix rather than replace so the
+            // rest of the build's toolchain stays reachable; an absent
+            // ambient PATH just yields the JDK's own bin.
+            let mut path = home.join("bin").into_os_string();
+            if let Some(current) = std::env::var_os("PATH") {
+                path.push(":");
+                path.push(current);
+            }
+            env.push((OsString::from("PATH"), path));
             env.push((OsString::from("JAVA_HOME"), home.into_os_string()));
         }
 
@@ -486,6 +505,23 @@ mod tests {
             .map(|(_, v)| PathBuf::from(v))
             .expect("JAVA_HOME present when the pin is satisfied");
         assert_eq!(java_home, fake_jdk.path());
+
+        // JAVA_HOME alone does not select the compiler: scip-java's launcher
+        // takes `java` from PATH and its forked javac follows that JVM, so
+        // the selected JDK's bin must lead PATH too (regression: a
+        // <release>25 target failed on an image whose PATH led with JDK 17).
+        let path = step
+            .env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+            .expect("PATH present when the pin is satisfied");
+        let expected_prefix = fake_jdk.path().join("bin").into_os_string();
+        assert!(
+            path.as_encoded_bytes()
+                .starts_with(expected_prefix.as_encoded_bytes()),
+            "selected JDK's bin must lead PATH, got {path:?}"
+        );
     }
 
     #[test]

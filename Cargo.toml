@@ -1,6 +1,6 @@
 [package]
 name = "tamga"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["tamga contributors"]
 description = "A standalone SCIP orchestrator: detect language/build families, prepare, run the right indexer, and merge into one repo-relative SCIP index."
